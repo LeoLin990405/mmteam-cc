@@ -1,0 +1,1637 @@
+#!/usr/bin/env python3
+"""
+mmteam — Multi-Model Agent Teams
+仿造 Claude Code 官方 agent-teams 架构，但 teammate 可以是任意 AI CLI
+（cc-kimi/doubao/glm/stepfun/minimax/mimo/qwen/codex/gemini）
+
+Commands:
+  mmteam create <name> <member-spec>...       # 建队 + 声明成员
+  mmteam spawn  <name>                         # 启动所有 teammate daemon（后台）
+  mmteam tasks  <name> add "desc" [--to id]    # 添加 / 指派任务
+  mmteam tasks  <name> list                    # 查看任务
+  mmteam tasks  <name> assign <task-id> <agent-id>
+  mmteam msg    <name> --from <a> --to <b> "text"  # 发消息
+  mmteam inbox  <name> <agent-id>              # 查 inbox
+  mmteam status <name>                         # 全景
+  mmteam stop   <name>                         # 停 daemon 留数据
+  mmteam destroy <name>                        # 彻底清理
+
+Member-spec: <agent-id>:<cli>[:model]
+  例：kimi:cc-kimi  doubao:cc-doubao:ark-code-latest  gpt54:codex:gpt-5.4
+"""
+import argparse, json, os, sys, time, uuid, subprocess, signal
+from pathlib import Path
+from datetime import datetime
+
+ROOT = Path.home() / ".claude" / "teams"
+ROOT.mkdir(parents=True, exist_ok=True)
+
+def team_dir(name): return ROOT / name
+def config_path(name): return team_dir(name) / "config.json"
+def tasks_path(name): return team_dir(name) / "tasks.json"
+def inbox_dir(name, agent): return team_dir(name) / "mailbox" / agent / "inbox"
+def outbox_dir(name, agent): return team_dir(name) / "mailbox" / agent / "outbox"
+def results_dir(name): return team_dir(name) / "results"
+def pid_file(name, agent): return team_dir(name) / f"{agent}.pid"
+def log_file(name, agent): return team_dir(name) / f"{agent}.log"
+
+def now(): return datetime.now().isoformat(timespec='seconds')
+
+def load_json(p, default):
+    try: return json.loads(p.read_text())
+    except: return default
+
+def save_json(p, d):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+
+# ────── CLI command builders for headless call ──────
+def build_headless_cmd(cli: str, model: str, prompt_file: str):
+    """返回 subprocess 可跑的命令列表，headless 读取 prompt_file"""
+    if cli.startswith("cc-"):
+        env_var = cli.upper().replace('-','_') + '_MODEL'
+        cmd = [cli, "--permission-mode", "acceptEdits", "-p"]
+        with open(prompt_file) as f: prompt = f.read()
+        cmd.append(prompt)
+        return cmd, ({env_var: model} if model else {})
+    if cli == "codex":
+        cmd = ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write"]
+        if model: cmd += ["-c", f'model="{model}"']
+        with open(prompt_file) as f: prompt = f.read()
+        cmd.append(prompt)
+        return cmd, {}
+    if cli == "gemini":
+        # gemini -p 需 stdin 非 tty；这里用 stdin pipe
+        cmd = ["gemini"]
+        if model: cmd += ["-m", model]
+        return cmd, {"_STDIN_FILE": prompt_file}  # 特殊标记
+    raise ValueError(f"unknown cli: {cli}")
+
+# ────── commands ──────
+def cmd_create(args):
+    name = args.name
+    td = team_dir(name)
+    if td.exists() and not args.force:
+        sys.exit(f"team {name} already exists (use --force)")
+    td.mkdir(parents=True, exist_ok=True)
+    members = []
+    for spec in args.members:
+        parts = spec.split(":")
+        if len(parts) < 2: sys.exit(f"bad spec: {spec}")
+        agent_id, cli = parts[0], parts[1]
+        model = parts[2] if len(parts) > 2 else ""
+        members.append({"id": agent_id, "cli": cli, "model": model})
+        inbox_dir(name, agent_id).mkdir(parents=True, exist_ok=True)
+        outbox_dir(name, agent_id).mkdir(parents=True, exist_ok=True)
+    results_dir(name).mkdir(parents=True, exist_ok=True)
+    save_json(config_path(name), {
+        "name": name, "created": now(),
+        "members": members,
+        "lead": args.lead or "user",
+    })
+    save_json(tasks_path(name), {"tasks": []})
+    print(f"✅ team '{name}' created with {len(members)} members:")
+    for m in members:
+        print(f"  - {m['id']} = {m['cli']}" + (f" ({m['model']})" if m['model'] else ""))
+    print(f"\nNext: mmteam spawn {name}")
+
+def cmd_tasks(args):
+    name = args.name
+    td = tasks_path(name)
+    if not td.exists(): sys.exit(f"team {name} not found")
+    data = load_json(td, {"tasks":[]})
+    if args.action == "add":
+        t = {
+            "id": str(uuid.uuid4())[:8], "desc": args.desc,
+            "status": "pending", "owner": args.to or "",
+            "created": now(), "updated": now(),
+        }
+        data["tasks"].append(t); save_json(td, data)
+        print(f"✅ task {t['id']}: {t['desc'][:60]}" + (f" → {args.to}" if args.to else ""))
+    elif args.action == "list":
+        for t in data["tasks"]:
+            marker = {"pending":"○","in_progress":"◐","completed":"●","failed":"✗"}.get(t["status"],"?")
+            print(f"{marker} [{t['id']}] ({t['status']:<11}) {t.get('owner','?'):<10} {t['desc'][:80]}")
+    elif args.action == "assign":
+        for t in data["tasks"]:
+            if t["id"] == args.task_id:
+                t["owner"] = args.agent_id; t["updated"] = now()
+                save_json(td, data)
+                print(f"✅ assigned {args.task_id} → {args.agent_id}")
+                return
+        sys.exit(f"task {args.task_id} not found")
+
+def cmd_msg(args):
+    name = args.name
+    cfg = load_json(config_path(name), None)
+    if not cfg: sys.exit(f"team {name} not found")
+    msg = {
+        "id": str(uuid.uuid4())[:8],
+        "from": args.from_, "to": args.to,
+        "ts": now(), "text": args.text
+    }
+    target = inbox_dir(name, args.to)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / f"{msg['id']}.json").write_text(json.dumps(msg, ensure_ascii=False, indent=2))
+    print(f"📨 {args.from_} → {args.to}: {args.text[:60]}")
+
+def cmd_inbox(args):
+    name, agent = args.name, args.agent_id
+    d = inbox_dir(name, agent)
+    if not d.exists(): sys.exit(f"no inbox for {agent} in {name}")
+    msgs = sorted(d.glob("*.json"))
+    if not msgs: print(f"(inbox empty: {agent})"); return
+    for f in msgs:
+        m = json.loads(f.read_text())
+        print(f"[{m['id']}] {m['ts']}  {m['from']} → {m['to']}")
+        print(f"  {m['text'][:200]}")
+        print()
+
+def cmd_status(args):
+    name = args.name
+    cfg = load_json(config_path(name), None)
+    if not cfg: sys.exit(f"team {name} not found")
+    print(f"=== Team: {name}  ===")
+    print(f"Lead: {cfg['lead']}  Created: {cfg['created']}")
+    print(f"\nMembers ({len(cfg['members'])}):")
+    for m in cfg['members']:
+        pid_f = pid_file(name, m['id'])
+        alive = "RUN" if pid_f.exists() and proc_alive(int(pid_f.read_text())) else "-"
+        inbox_n = len(list(inbox_dir(name, m['id']).glob("*.json"))) if inbox_dir(name, m['id']).exists() else 0
+        model = m.get('model') or '(default)'
+        print(f"  [{alive}] {m['id']:<12} {m['cli']:<12} {model:<25} inbox={inbox_n}")
+    tasks = load_json(tasks_path(name), {"tasks":[]})["tasks"]
+    by_status = {}
+    for t in tasks: by_status[t["status"]] = by_status.get(t["status"],0) + 1
+    print(f"\nTasks ({len(tasks)}): " + " · ".join(f"{k}={v}" for k,v in by_status.items()))
+    for t in tasks[-10:]:
+        marker = {"pending":"○","in_progress":"◐","completed":"●","failed":"✗"}.get(t["status"],"?")
+        print(f"  {marker} [{t['id']}] {t.get('owner','?'):<10} {t['desc'][:70]}")
+
+def proc_alive(pid):
+    try: os.kill(pid, 0); return True
+    except: return False
+
+def cmd_spawn(args):
+    """启动所有 teammate daemon（默认后台 headless；--dock 改走 cmux tab 可见 TUI）"""
+    name = args.name
+    cfg = load_json(config_path(name), None)
+    if not cfg: sys.exit(f"team {name} not found")
+    cfg["dock_mode"] = bool(args.dock)
+    save_json(config_path(name), cfg)
+    mode = "dock (cmux TUI)" if args.dock else "headless"
+    print(f"[mode={mode}]")
+    # Pre-create cmux dock pane ONCE to avoid daemon race
+    if args.dock:
+        try:
+            pane = cmux_dock_pane()
+            print(f"  [DOCK-PANE] {pane} (shared by all teammates)")
+        except Exception as e:
+            sys.exit(f"cmux dock pane setup failed: {e}")
+    for m in cfg["members"]:
+        pf = pid_file(name, m["id"])
+        if pf.exists() and proc_alive(int(pf.read_text())):
+            print(f"  [SKIP] {m['id']} already running pid={pf.read_text()}"); continue
+        logf = open(log_file(name, m["id"]), "a")
+        daemon_mode = "daemon-dock" if args.dock else "daemon"
+        proc = subprocess.Popen(
+            [sys.executable, __file__, daemon_mode, name, m["id"]],
+            stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+            start_new_session=True)
+        pf.write_text(str(proc.pid))
+        print(f"  [SPAWN] {m['id']} pid={proc.pid} ({m['cli']})")
+    print(f"\n✅ {len(cfg['members'])} teammates spawned. mmteam status {name}")
+
+def cmd_stop(args):
+    name = args.name
+    cfg = load_json(config_path(name), None)
+    if not cfg: sys.exit(f"team {name} not found")
+    for m in cfg["members"]:
+        pf = pid_file(name, m["id"])
+        if pf.exists():
+            pid = int(pf.read_text())
+            if proc_alive(pid):
+                try: os.kill(pid, signal.SIGTERM); print(f"  [STOP] {m['id']} pid={pid}")
+                except: pass
+            pf.unlink(missing_ok=True)
+        # Close cmux surface if dock mode was used
+        sf = team_dir(name) / f"{m['id']}.surface"
+        if sf.exists():
+            surf = sf.read_text().strip()
+            # Try to gracefully /exit then close
+            try: subprocess.run(["cmux","send","--surface",surf,"/exit"], timeout=3)
+            except: pass
+            try: subprocess.run(["cmux","send-key","--surface",surf,"Return"], timeout=3)
+            except: pass
+            time.sleep(2)
+            try: subprocess.run(["cmux","close-surface","--surface",surf], timeout=3)
+            except: pass
+            sf.unlink(missing_ok=True)
+            print(f"  [CLOSE-TAB] {m['id']} {surf}")
+    print(f"✅ team {name} stopped")
+
+def cmd_destroy(args):
+    import shutil
+    name = args.name
+    cmd_stop(args)
+    td = team_dir(name)
+    if td.exists():
+        shutil.rmtree(td)
+        print(f"🗑  team {name} destroyed")
+
+# ────── daemon loop ──────
+def run_daemon(name, agent_id):
+    """后台循环：轮询 inbox + 任务，有新任务/消息就调 CLI headless 跑"""
+    cfg = load_json(config_path(name), None)
+    if not cfg: sys.exit(f"team {name} not found")
+    me = next((m for m in cfg["members"] if m["id"] == agent_id), None)
+    if not me: sys.exit(f"member {agent_id} not in team {name}")
+    cli, model = me["cli"], me.get("model", "")
+    log_fp = log_file(name, agent_id).open("a")
+    def L(s): log_fp.write(f"[{now()}] {s}\n"); log_fp.flush()
+    L(f"daemon start: cli={cli} model={model}")
+
+    ibx = inbox_dir(name, agent_id); ibx.mkdir(parents=True, exist_ok=True)
+    obx = outbox_dir(name, agent_id); obx.mkdir(parents=True, exist_ok=True)
+    tpath = tasks_path(name)
+    processed_msgs = set()
+
+    while True:
+        try:
+            # 1. 处理 inbox 新消息：消息即 prompt，直接跑 CLI，结果写到 outbox + 发回发件人
+            for mf in sorted(ibx.glob("*.json")):
+                if mf.name in processed_msgs: continue
+                m = json.loads(mf.read_text())
+                L(f"msg from {m['from']}: {m['text'][:80]}")
+                out = run_cli(cli, model, m["text"], log_fp)
+                # Save outbox
+                reply = {"id": str(uuid.uuid4())[:8], "replyTo": m["id"],
+                         "from": agent_id, "to": m["from"], "ts": now(), "text": out}
+                (obx / f"{reply['id']}.json").write_text(json.dumps(reply, ensure_ascii=False, indent=2))
+                # Push to sender's inbox
+                other_ibx = inbox_dir(name, m["from"])
+                other_ibx.mkdir(parents=True, exist_ok=True)
+                (other_ibx / f"{reply['id']}.json").write_text(json.dumps(reply, ensure_ascii=False, indent=2))
+                processed_msgs.add(mf.name)
+                # Archive original
+                mf.unlink(missing_ok=True)
+
+            # 2. 领取 pending 指给自己的任务
+            tdata = load_json(tpath, {"tasks":[]})
+            changed = False
+            for t in tdata["tasks"]:
+                if t["status"] == "pending" and t.get("owner") == agent_id:
+                    t["status"] = "in_progress"; t["updated"] = now()
+                    changed = True
+                    L(f"claim task {t['id']}: {t['desc'][:80]}")
+                    save_json(tpath, tdata)
+                    out = run_cli(cli, model, t["desc"], log_fp)
+                    # Write result
+                    rpath = results_dir(name) / f"{t['id']}-{agent_id}.md"
+                    rpath.write_text(f"# Task {t['id']}\n\n**Agent**: {agent_id} ({cli})\n**Prompt**: {t['desc']}\n\n---\n\n{out}")
+                    # Reload tasks.json (other daemons may have modified it) and update status
+                    tdata2 = load_json(tpath, {"tasks":[]})
+                    for tt in tdata2["tasks"]:
+                        if tt["id"] == t["id"]:
+                            tt["status"] = "completed"; tt["updated"] = now()
+                            tt["result_file"] = str(rpath)
+                    save_json(tpath, tdata2)
+                    L(f"completed task {t['id']}")
+                    break
+            time.sleep(2)
+        except KeyboardInterrupt:
+            L("daemon interrupted"); break
+        except Exception as e:
+            L(f"ERROR: {e}"); time.sleep(5)
+
+# ────── cmux dock integration ──────
+import re as _re
+CMUX_DOCK_STATE = "/tmp/cmux-dock-pane"
+
+def cmux(*args, capture=False):
+    """Invoke cmux CLI, return stdout text or (ok bool if not capture)"""
+    try:
+        r = subprocess.run(["cmux", *args], capture_output=True, text=True, timeout=10)
+        return r.stdout if capture else (r.returncode == 0)
+    except Exception:
+        return "" if capture else False
+
+def cmux_dock_pane():
+    """Get or create the dock pane (vertical right split)"""
+    try: pane = Path(CMUX_DOCK_STATE).read_text().strip()
+    except: pane = ""
+    # Verify alive
+    if pane and pane in cmux("tree", capture=True): return pane
+    out = cmux("new-pane", "--direction", "right", capture=True)
+    m = _re.search(r"pane:\d+", out or "")
+    if not m: raise RuntimeError("failed to create cmux dock pane")
+    pane = m.group(0)
+    Path(CMUX_DOCK_STATE).write_text(pane)
+    return pane
+
+def cmux_new_surface(pane: str, title: str) -> str:
+    out = cmux("new-surface", "--pane", pane, capture=True)
+    m = _re.search(r"surface:\d+", out or "")
+    if not m: raise RuntimeError("failed to create surface")
+    surf = m.group(0)
+    cmux("rename-tab", "--surface", surf, title)
+    return surf
+
+def cmux_send(surf: str, text: str):
+    cmux("send", "--surface", surf, text)
+
+def cmux_enter(surf: str):
+    cmux("send-key", "--surface", surf, "Return")
+
+def cmux_read(surf: str, scrollback=False) -> str:
+    args = ["read-screen", "--surface", surf]
+    if scrollback: args.append("--scrollback")
+    return cmux(*args, capture=True) or ""
+
+def cmux_close(surf: str):
+    cmux("close-surface", "--surface", surf)
+
+# ── cmux workspace/multi-pane helpers (for A2A --dock grid layout) ──
+def cmux_new_workspace(name: str, cwd: str = "") -> str:
+    args = ["new-workspace", "--name", name]
+    if cwd: args += ["--cwd", cwd]
+    out = cmux(*args, capture=True) or ""
+    m = _re.search(r"workspace:\d+", out)
+    if not m: raise RuntimeError(f"failed to create workspace '{name}': {out!r}")
+    return m.group(0)
+
+def cmux_select_workspace(ws: str):
+    cmux("select-workspace", "--workspace", ws)
+
+def cmux_close_workspace(ws: str):
+    cmux("close-workspace", "--workspace", ws)
+
+def cmux_list_panes(ws: str) -> list:
+    out = cmux("list-panes", "--workspace", ws, capture=True) or ""
+    # Extract "pane:N" refs preserving order of appearance (dedup)
+    seen, panes = set(), []
+    for m in _re.finditer(r"pane:\d+", out):
+        if m.group(0) not in seen: seen.add(m.group(0)); panes.append(m.group(0))
+    return panes
+
+def cmux_list_surfaces(ws: str) -> list:
+    """Return surface refs in workspace in creation order (via cmux tree)."""
+    out = cmux("tree", "--workspace", ws, capture=True) or ""
+    seen, surfs = set(), []
+    for m in _re.finditer(r"surface:\d+", out):
+        if m.group(0) not in seen: seen.add(m.group(0)); surfs.append(m.group(0))
+    return surfs
+
+def cmux_focus_pane(pane: str, ws: str = ""):
+    args = ["focus-pane", "--pane", pane]
+    if ws: args += ["--workspace", ws]
+    cmux(*args)
+
+def _find_surface_for_pane(tree_json_str: str, pane_ref: str) -> str:
+    """Given `cmux tree --json` output and a pane ref like 'pane:8', find the
+    first surface_ref inside that pane. Returns '' on failure.
+
+    Shape: tree.windows[].workspaces[].panes[].{ref, surface_refs:[...]}
+    """
+    try:
+        import json as _json
+        t = _json.loads(tree_json_str)
+    except Exception:
+        return ""
+    for win in t.get("windows", []):
+        for ws in win.get("workspaces", []):
+            for pane in ws.get("panes", []):
+                if pane.get("ref") == pane_ref:
+                    srefs = pane.get("surface_refs") or []
+                    if srefs: return srefs[0]
+    return ""
+
+def cmux_build_grid(ws: str, n: int) -> list:
+    """Build a visible grid of n panes in workspace ws, return surface refs in
+    insertion order (len >= n). Supports 1-6 cleanly; 7+ logged as unsupported
+    (dock mode is visually useless past 6 teammates — use headless instead).
+
+    Layouts:  1=single  2=1x2  3=L+R/2  4=2x2  5-6=2x3
+    """
+    if n <= 1: return cmux_list_surfaces(ws)[:1]
+    if n > 6:
+        raise ValueError(f"dock mode supports up to 6 teammates (got {n}). Use headless mode for larger teams.")
+
+    def _split(direction: str):
+        cmux("new-split", direction, "--workspace", ws); time.sleep(0.2)
+
+    # Build 2 columns first (applies to n=2..6)
+    _split("right")
+    if n == 2: return cmux_list_surfaces(ws)[:2]
+
+    # n>=3: split right column down
+    _split("down")
+    if n == 3: return cmux_list_surfaces(ws)[:3]
+
+    # n>=4: focus left and split down (→ 2x2)
+    panes = cmux_list_panes(ws)
+    cmux_focus_pane(panes[0], ws); time.sleep(0.1)
+    _split("down")
+    if n == 4: return cmux_list_surfaces(ws)[:4]
+
+    # n>=5: add third column — focus original left-top, split right → 3 columns
+    # layout now: col1[top,bot]  col2[top,bot]  new col3 will be created from col1-top
+    panes = cmux_list_panes(ws)
+    cmux_focus_pane(panes[0], ws); time.sleep(0.1)
+    _split("right")
+    if n == 5: return cmux_list_surfaces(ws)[:5]
+
+    # n==6: split the new third column down too
+    _split("down")
+    return cmux_list_surfaces(ws)[:6]
+
+def launch_cli_in_tab(cli: str, model: str, surf: str):
+    """Send command to launch the Agent's interactive TUI in the tab, handle init"""
+    env_prefix = ""
+    extra = ""
+    if cli.startswith("cc-"):
+        env_var = cli.upper().replace('-','_') + '_MODEL'
+        if model: env_prefix = f"{env_var}={model} "
+        extra = "--permission-mode acceptEdits"
+    elif cli == "codex":
+        extra = "--full-auto"
+        if model: extra += f' -c model="{model}"'
+    elif cli == "gemini":
+        extra = "--approval-mode yolo"
+        if model: extra += f" -m {model}"
+    cmd = f"{env_prefix}{cli} {extra}".strip()
+    cmux_send(surf, cmd)
+    cmux_enter(surf)
+    # Wait for TUI ready
+    time.sleep(7)
+
+# Idle / working regex
+_IDLE_RE = _re.compile(r'^❯[\s\xa0]*$|Find and fix a bug|Type your (message|prompt)|YOLO Ctrl\+Y|gpt-[0-9].*·[\s\xa0]', _re.M)
+# BUSY covers: "… (Ns)", token counter, CC spinner verbs (Puttering/Julienning/Churned/Waddling/
+# Propagating/Tinkering/Topsy/Crunched/Hmm/Thinking/Crunching), tool pending markers, ✻/✢ icons
+_BUSY_RE = _re.compile(
+    r'…[\s\xa0]*\([0-9]+s|'
+    r'· ↓ [0-9]+ tokens|'
+    r'esc to (cancel|interrupt)|'
+    r'ctrl\+b to run|'
+    r'⎿[\s\xa0]+(Running|Running…|Hmm)|'
+    r'[✻✢⠙⠹⠸⠼⠴⠦⠧⠇⠏⏵]\s*[A-Z]\w+(ing|ed|ning)|'
+    r'(Puttering|Julienning|Churned|Waddling|Propagating|Tinkering|Topsy-turvying|Crunched|Crunching|Thinking|Hmm|Pondering|Noodling|Flabbergasting|Cerebrating|Mulling|Scheming|Ruminating|Wondering)'
+)
+_CONFIRM_RE = _re.compile(r'Do you want to (make this edit|proceed|allow|run)|Allow Claude|Run this (command|bash)|\(Y/n\)|\(y/n\)|Approve this|将执行以下命令|允许.*吗')
+
+def wait_idle(surf: str, log_fp, max_s=600) -> str:
+    """Wait for Agent to finish responding; auto-approve dialogs; return final scrollback"""
+    elapsed = 0
+    idle = 0
+    while elapsed < max_s:
+        screen = cmux_read(surf)
+        if not screen: return ""
+        if _CONFIRM_RE.search(screen):
+            cmux_send(surf, "1"); cmux_enter(surf)
+            log_fp.write(f"[{now()}] auto-confirmed dialog\n"); log_fp.flush()
+            time.sleep(1); idle = 0; continue
+        if _BUSY_RE.search(screen):
+            idle = 0
+        elif _IDLE_RE.search(screen):
+            idle += 1
+        else:
+            idle = 0
+        if idle >= 3: break
+        time.sleep(3); elapsed += 3
+    return cmux_read(surf, scrollback=True)
+
+def send_prompt_to_tab(surf: str, prompt: str) -> int:
+    """Type prompt + Enter in the tab. Return scrollback length at send time (for diff extraction)."""
+    before = cmux_read(surf, scrollback=True)
+    mark_len = len(before)
+    cmux_send(surf, prompt)
+    time.sleep(0.5)
+    cmux_enter(surf)
+    return mark_len
+
+def extract_response_diff(scrollback_after: str, mark_len: int, prompt: str) -> str:
+    """Return text after mark_len, strip prompt echo + UI chrome"""
+    tail = scrollback_after[mark_len:] if mark_len < len(scrollback_after) else scrollback_after
+    # Drop terminal raster clear sequences & trailing idle prompt UI
+    tail = _re.sub(r'\n─+\n[\s\S]*$', '', tail)  # drop final separator + below
+    # Drop leading prompt echo (first ~2 lines containing prompt text)
+    lines = tail.split('\n')
+    first_line = prompt.split('\n',1)[0][:30]
+    for i, l in enumerate(lines[:10]):
+        if first_line and first_line[:10] in l:
+            lines = lines[i+1:]; break
+    # Drop leading "❯" continuation lines
+    while lines and lines[0].strip().startswith('❯'):
+        lines.pop(0)
+    return '\n'.join(lines).strip()[-8000:]
+
+def run_daemon_dock(name, agent_id):
+    """Same loop as run_daemon but uses a persistent cmux tab instead of headless subprocess"""
+    cfg = load_json(config_path(name), None)
+    if not cfg: sys.exit(f"team {name} not found")
+    me = next((m for m in cfg["members"] if m["id"] == agent_id), None)
+    if not me: sys.exit(f"member {agent_id} not in team {name}")
+    cli, model = me["cli"], me.get("model", "")
+    log_fp = log_file(name, agent_id).open("a")
+    def L(s): log_fp.write(f"[{now()}] {s}\n"); log_fp.flush()
+    L(f"daemon-dock start: cli={cli} model={model}")
+
+    # Create cmux tab for this teammate
+    try:
+        pane = cmux_dock_pane()
+        surf = cmux_new_surface(pane, f"{name}/{agent_id}")
+        L(f"created tab {surf} in pane {pane}")
+    except Exception as e:
+        L(f"cmux setup failed: {e}"); return
+    # Remember surface in team dir so stop can close it
+    (team_dir(name) / f"{agent_id}.surface").write_text(surf)
+
+    launch_cli_in_tab(cli, model, surf)
+
+    ibx = inbox_dir(name, agent_id); ibx.mkdir(parents=True, exist_ok=True)
+    obx = outbox_dir(name, agent_id); obx.mkdir(parents=True, exist_ok=True)
+    tpath = tasks_path(name)
+
+    while True:
+        try:
+            # 1. Process inbox messages via the tab
+            for mf in sorted(ibx.glob("*.json")):
+                m = json.loads(mf.read_text())
+                L(f"msg from {m['from']}: {m['text'][:80]}")
+                send_prompt_to_tab(surf, m["text"])
+                screen = wait_idle(surf, log_fp)
+                out = extract_last_response(screen, m["text"])
+                reply = {"id": str(uuid.uuid4())[:8], "replyTo": m["id"],
+                         "from": agent_id, "to": m["from"], "ts": now(), "text": out}
+                (obx / f"{reply['id']}.json").write_text(json.dumps(reply, ensure_ascii=False, indent=2))
+                other_ibx = inbox_dir(name, m["from"])
+                other_ibx.mkdir(parents=True, exist_ok=True)
+                (other_ibx / f"{reply['id']}.json").write_text(json.dumps(reply, ensure_ascii=False, indent=2))
+                mf.unlink(missing_ok=True)
+
+            # 2. Claim pending tasks
+            tdata = load_json(tpath, {"tasks":[]})
+            for t in tdata["tasks"]:
+                if t["status"] == "pending" and t.get("owner") == agent_id:
+                    t["status"] = "in_progress"; t["updated"] = now()
+                    save_json(tpath, tdata)
+                    L(f"claim task {t['id']}: {t['desc'][:80]}")
+                    send_prompt_to_tab(surf, t["desc"])
+                    screen = wait_idle(surf, log_fp)
+                    out = extract_last_response(screen, t["desc"])
+                    rpath = results_dir(name) / f"{t['id']}-{agent_id}.md"
+                    rpath.write_text(f"# Task {t['id']}\n\n**Agent**: {agent_id} ({cli}){f' [{model}]' if model else ''}\n**Prompt**: {t['desc']}\n\n---\n\n{out}")
+                    tdata2 = load_json(tpath, {"tasks":[]})
+                    for tt in tdata2["tasks"]:
+                        if tt["id"] == t["id"]:
+                            tt["status"] = "completed"; tt["updated"] = now()
+                            tt["result_file"] = str(rpath)
+                    save_json(tpath, tdata2)
+                    L(f"completed task {t['id']} → {rpath}")
+                    break
+
+            time.sleep(2)
+        except KeyboardInterrupt:
+            L("interrupted"); break
+        except Exception as e:
+            L(f"ERROR: {e}"); time.sleep(5)
+
+def run_cli(cli: str, model: str, prompt: str, log_fp) -> str:
+    """Run CLI headless, return stdout"""
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(prompt); pfile = f.name
+    try:
+        env = os.environ.copy()
+        if cli.startswith("cc-"):
+            env_var = cli.upper().replace('-','_') + '_MODEL'
+            if model: env[env_var] = model
+            # cc-* -p PROMPT
+            p = subprocess.run(
+                [cli, "--permission-mode","acceptEdits","-p", prompt],
+                env=env, capture_output=True, text=True, timeout=600)
+            return p.stdout + (f"\n[stderr]{p.stderr[:300]}" if p.returncode != 0 else "")
+        if cli == "codex":
+            cmd = ["codex","exec","--skip-git-repo-check","--sandbox","workspace-write"]
+            if model: cmd += ["-c", f'model="{model}"']
+            cmd.append(prompt)
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            return p.stdout
+        if cli == "gemini":
+            cmd = ["gemini"]
+            if model: cmd += ["-m", model]
+            with open(pfile) as fstdin:
+                p = subprocess.run(cmd, stdin=fstdin, capture_output=True, text=True, timeout=600)
+            return p.stdout
+        return f"unknown cli: {cli}"
+    finally:
+        os.unlink(pfile)
+
+# ────── a2a subcommands (Phase 1e) ──────
+# HTTP client for A2A JSON-RPC. Uses stdlib urllib to avoid new deps.
+A2A_SERVER_SCRIPT  = str(Path.home() / "bin" / "mmteam-a2a-server.py")
+A2A_MONITOR_SCRIPT = str(Path.home() / "bin" / "mmteam-a2a-monitor.py")
+def a2a_registry_path(team): return team_dir(team) / "a2a-registry.json"
+def a2a_pid_path(team, agent): return team_dir(team) / f"{agent}.a2a.pid"
+def a2a_card_path(team, agent): return team_dir(team) / "agent-cards" / f"{agent}.json"
+
+def _a2a_load_registry(team): return load_json(a2a_registry_path(team), {})
+def _a2a_save_registry(team, d): save_json(a2a_registry_path(team), d)
+
+def _a2a_rpc(url: str, token: str, method: str, params: dict, rpc_id=1, timeout=1800):
+    import urllib.request, urllib.error
+    req = urllib.request.Request(url,
+        data=json.dumps({"jsonrpc":"2.0","id":rpc_id,"method":method,"params":params}).encode(),
+        headers={"Content-Type":"application/json","Authorization":f"Bearer {token}"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read().decode(errors="replace"))
+
+def _a2a_http_get(url: str, timeout=10):
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read())
+
+def cmd_a2a_spawn(args):
+    name = args.name
+    cfg = load_json(config_path(name), None)
+    if not cfg: sys.exit(f"team {name} not found")
+    dock = bool(getattr(args, "dock", False))
+    monitor = bool(getattr(args, "monitor", False))
+    members = cfg["members"]
+
+    # Per-teammate env: in dock mode we allocate one cmux surface per teammate
+    # within a fresh workspace, then inject A2A_CMUX_WORKSPACE + A2A_CMUX_SURFACE
+    # into the a2a-server subprocess so CmuxDockBackend picks up the pre-built surface.
+    teammate_env = {m["id"]: {} for m in members}
+    ws = ""; mon_surf = ""
+    if dock:
+        try:
+            ws = cmux_new_workspace(f"{name}-a2a", cwd=os.getcwd())
+            cmux_select_workspace(ws); time.sleep(0.3)
+            print(f"  [WORKSPACE] {ws} name={name}-a2a")
+        except Exception as e: sys.exit(f"cmux workspace setup failed: {e}")
+        orig_pane_id = cmux_list_panes(ws)[0] if cmux_list_panes(ws) else ""
+        if monitor:
+            panes_before = set(cmux_list_panes(ws))
+            cmux("new-split", "up", "--workspace", ws); time.sleep(0.3)
+            panes_after = cmux_list_panes(ws)
+            new_panes = [p for p in panes_after if p not in panes_before]
+            mon_pane = new_panes[0] if new_panes else panes_after[-1]
+            # Find the surface for mon_pane via tree JSON (stable mapping)
+            import json as _json
+            tree = cmux("tree", "--workspace", ws, "--json", capture=True) or "{}"
+            mon_surf = _find_surface_for_pane(tree, mon_pane)
+            # Focus the ORIGINAL pane (below) so grid builds in the lower region
+            cmux_focus_pane(orig_pane_id, ws); time.sleep(0.2)
+        surfs_before_grid = set(cmux_list_surfaces(ws))
+        try:
+            cmux_build_grid(ws, len(members))
+            # The teammate surfaces are those that appeared AFTER the monitor split.
+            all_surfs = cmux_list_surfaces(ws)
+            if monitor:
+                surfs = [s for s in all_surfs if s != mon_surf][:len(members)]
+            else:
+                surfs = all_surfs[:len(members)]
+        except Exception as e:
+            print(f"[ERR] build grid failed: {e}", file=sys.stderr)
+            cmux_close_workspace(ws); sys.exit(1)
+        # Persist workspace ref for stop cleanup
+        save_json(team_dir(name) / "a2a-workspace.json", {"workspace": ws, "monitor_surface": mon_surf})
+        for m, surf in zip(members, surfs):
+            teammate_env[m["id"]] = {"A2A_CMUX_WORKSPACE": ws, "A2A_CMUX_SURFACE": surf}
+            try: cmux("rename-tab", "--surface", surf, f"{name}/{m['id']}")
+            except Exception: pass
+
+    reg = _a2a_load_registry(name)
+    for m in members:
+        pf = a2a_pid_path(name, m["id"])
+        if pf.exists() and proc_alive(int(pf.read_text())):
+            print(f"  [SKIP] {m['id']} a2a-server already running pid={pf.read_text()}"); continue
+        logf = open(log_file(name, m["id"]).parent / f"{m['id']}.a2a.log", "a")
+        cmd = [sys.executable, A2A_SERVER_SCRIPT, "--team", name, "--agent", m["id"]]
+        if getattr(args, "port", None): cmd += ["--port", str(args.port)]
+        if dock: cmd.append("--dock")
+        env = {**os.environ, **teammate_env[m["id"]]}
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+                                start_new_session=True, env=env)
+        # Wait longer in dock mode — CLI TUI boot takes ~7s
+        wait_iters = 150 if dock else 30
+        for _ in range(wait_iters):
+            time.sleep(0.1)
+            reg = _a2a_load_registry(name)
+            if m["id"] in reg: break
+        if m["id"] in reg:
+            where = f" pane={teammate_env[m['id']].get('A2A_CMUX_SURFACE','-')}" if dock else ""
+            print(f"  [SPAWN] {m['id']} pid={proc.pid} url={reg[m['id']]['url']}{where}")
+        else:
+            print(f"  [WARN] {m['id']} pid={proc.pid} but not registered yet (check {logf.name})")
+
+    if monitor and mon_surf:
+        # Pass --workspace explicitly: cmux's default is the caller's workspace, not ours.
+        cmux("send", "--surface", mon_surf, "--workspace", ws,
+             f"{sys.executable} {A2A_MONITOR_SCRIPT} {name}")
+        cmux("send-key", "--surface", mon_surf, "--workspace", ws, "Return")
+        try: cmux("rename-tab", "--surface", mon_surf, f"{name}/a2a-monitor")
+        except Exception: pass
+
+    mode = "dock+monitor" if dock and monitor else ("dock" if dock else "headless")
+    print(f"\n✅ a2a mode={mode} up. mmteam a2a card {name} <agent> / send ...")
+
+def cmd_a2a_stop(args):
+    name = args.name
+    cfg = load_json(config_path(name), None)
+    if not cfg: sys.exit(f"team {name} not found")
+    pids = []
+    for m in cfg["members"]:
+        pf = a2a_pid_path(name, m["id"])
+        if pf.exists():
+            pid = int(pf.read_text())
+            if proc_alive(pid):
+                try: os.kill(pid, signal.SIGTERM); pids.append((m["id"], pid)); print(f"  [STOP] {m['id']} pid={pid}")
+                except Exception as e: print(f"  [WARN] kill {m['id']}: {e}")
+    # Wait for daemon atexit handlers to finish cleaning registry themselves
+    for _ in range(30):
+        if all(not proc_alive(pid) for _, pid in pids): break
+        time.sleep(0.1)
+    # Final scrub in case any daemon died before cleaning (SIGKILL, crashes)
+    reg = _a2a_load_registry(name)
+    changed = False
+    for mid in list(reg):
+        if reg[mid].get("kind") == "local":
+            pf = a2a_pid_path(name, mid)
+            if not pf.exists() or not proc_alive(int(pf.read_text() or 0)):
+                del reg[mid]; changed = True
+    if changed: _a2a_save_registry(name, reg)
+    for mid, _ in pids: a2a_pid_path(name, mid).unlink(missing_ok=True)
+
+    # Dock mode: close the cmux workspace recorded at spawn time
+    wsf = team_dir(name) / "a2a-workspace.json"
+    if wsf.exists():
+        try:
+            ws = load_json(wsf, {}).get("workspace", "")
+            if ws:
+                cmux_close_workspace(ws); print(f"  [WORKSPACE-CLOSED] {ws}")
+        except Exception as e:
+            print(f"  [WARN] workspace close: {e}")
+        finally:
+            wsf.unlink(missing_ok=True)
+
+def _a2a_resolve(team, agent):
+    reg = _a2a_load_registry(team)
+    if agent not in reg: sys.exit(f"agent {agent} not in a2a-registry (spawn or register first)")
+    e = reg[agent]
+    return e["url"], e["bearer_token"]
+
+def cmd_a2a_card(args):
+    url, _ = _a2a_resolve(args.name, args.agent)
+    # Card endpoint is public (no auth required by A2A spec)
+    card = _a2a_http_get(url.rstrip("/") + "/.well-known/agent-card.json")
+    print(json.dumps(card, ensure_ascii=False, indent=2))
+
+def cmd_a2a_send(args):
+    url, tok = _a2a_resolve(args.name, args.agent)
+    msg = {"role": "user", "messageId": str(uuid.uuid4()),
+           "parts": [{"kind": "text", "text": args.text}]}
+    if getattr(args, "session", ""):
+        msg["contextId"] = args.session
+    params = {"message": msg}
+    resp = _a2a_rpc(url, tok, "message/send", params)
+    if "error" in resp: print(json.dumps(resp, ensure_ascii=False, indent=2)); sys.exit(1)
+    r = resp["result"]
+    # cmd_a2a_send: return compact JSON (no USD — users are on token plans).
+    # Keep usage dict; downstream tooling can still compute USD via _PRICING if needed.
+    print(json.dumps({"id": r.get("id"), "status": r.get("status"),
+        "artifact_count": len(r.get("artifacts", [])),
+        "usage": r.get("usage", {}),
+        "elapsed_s": r.get("elapsed_s"),
+        "first_text": (r.get("artifacts",[{}])[0].get("parts",[{}])[0].get("text","") if r.get("artifacts") else "")[:400]
+    }, ensure_ascii=False, indent=2))
+
+def cmd_a2a_get(args):
+    url, tok = _a2a_resolve(args.name, args.agent)
+    resp = _a2a_rpc(url, tok, "tasks/get", {"id": args.task_id}, timeout=10)
+    print(json.dumps(resp.get("result", resp), ensure_ascii=False, indent=2))
+
+def cmd_a2a_cancel(args):
+    url, tok = _a2a_resolve(args.name, args.agent)
+    resp = _a2a_rpc(url, tok, "tasks/cancel", {"id": args.task_id}, timeout=30)
+    print(json.dumps(resp.get("result", resp), ensure_ascii=False, indent=2))
+
+def cmd_a2a_register(args):
+    reg = _a2a_load_registry(args.name)
+    reg[args.agent] = {"url": args.url.rstrip("/") + "/", "bearer_token": args.token, "kind": "remote"}
+    _a2a_save_registry(args.name, reg)
+    print(f"registered {args.agent} → {args.url}")
+
+def cmd_a2a_discover(args):
+    url = args.url.rstrip("/") + "/.well-known/agent-card.json"
+    print(f"GET {url}")
+    card = _a2a_http_get(url)
+    print(json.dumps(card, ensure_ascii=False, indent=2))
+
+def cmd_a2a_quota(args):
+    """Plan-subscription quota monitor: count requests per rolling window (5h / 1h / 5min)
+    per teammate, help see if approaching subscription caps (Kimi Allegretto 300-1200/5h etc)."""
+    from datetime import datetime as _dt, timedelta
+    name = args.name
+    ledger = team_dir(name) / "cost-ledger.jsonl"
+    if not ledger.exists():
+        print(f"(no ledger for {name} — no completed tasks yet)"); return
+    rows = []
+    for line in ledger.read_text().splitlines():
+        try: rows.append(json.loads(line))
+        except Exception: continue
+    if not rows:
+        print("(ledger empty)"); return
+
+    now = _dt.now()
+    windows = {"5min": timedelta(minutes=5), "1h": timedelta(hours=1), "5h": timedelta(hours=5), "24h": timedelta(hours=24)}
+    per_agent = {}
+    for r in rows:
+        try: ts = _dt.fromisoformat(r.get("ts","").split("+")[0])
+        except Exception: continue
+        age = now - ts
+        aid = r.get("agent", "?")
+        bucket = per_agent.setdefault(aid, {w: 0 for w in windows})
+        bucket["tokens_24h"] = bucket.get("tokens_24h", 0)
+        for w, dt in windows.items():
+            if age <= dt: bucket[w] += 1
+        if age <= windows["24h"]:
+            bucket["tokens_24h"] += (r.get("usage") or {}).get("total", 0)
+
+    if args.json:
+        print(json.dumps({"team": name, "now": now.isoformat(timespec='seconds'),
+                          "per_agent": per_agent}, ensure_ascii=False, indent=2))
+        return
+    cfg = load_json(config_path(name), {}) or {}
+    id_to_cli = {m["id"]: m["cli"] for m in cfg.get("members", [])}
+    print(f"\n━━━ quota · team={name} · now={now.strftime('%Y-%m-%d %H:%M')} ━━━")
+    hdr = f"  {'agent':<12s} {'5min':>5s} {'1h':>5s} {'5h':>5s} {'24h':>5s} {'cap_5h':>7s} {'pct':>6s} {'tokens_24h':>12s}"
+    print(hdr); print("  " + "-"*len(hdr))
+    for aid, b in sorted(per_agent.items()):
+        cli = id_to_cli.get(aid, "")
+        slug = cli[3:] if cli.startswith("cc-") else cli[:-5] if cli.endswith("-code") else cli
+        cap = _PLAN_CAPS_5H.get(slug, float("inf"))
+        cap_str = "∞" if cap == float("inf") else str(cap)
+        pct = round(b['5h']/cap*100, 1) if cap != float("inf") and cap else 0
+        warn = ""
+        if cap != float("inf"):
+            if pct >= 95: warn = " ⛔"
+            elif pct >= 80: warn = " ⚠️"
+        pct_str = f"{pct:>5.1f}%" if cap != float("inf") else "   — "
+        print(f"  {aid:<12s} {b['5min']:>5d} {b['1h']:>5d} {b['5h']:>5d} {b['24h']:>5d} {cap_str:>7s} {pct_str:>6s}{warn} {b.get('tokens_24h',0):>12,d}")
+    print("\n  caps 基于 vault memory 各家套餐最低档：Kimi 300/5h · GLM 200/5h · Doubao 500/5h 等")
+    print("  ⚠️ ≥80% 会被 ask 惩罚 0.5×；⛔ ≥95% 会被 fanout 自动跳过（--no-skip-full 可强制）")
+
+def cmd_a2a_cost(args):
+    """Aggregate the team's cost ledger (persisted by a2a-server on each completed task).
+    Supports --since date filter, --by agent|day|cli grouping, --json output."""
+    name = args.name
+    ledger = team_dir(name) / "cost-ledger.jsonl"
+    if not ledger.exists():
+        print(f"(no cost-ledger for {name} — no completed tasks yet)"); return
+    rows = []
+    for line in ledger.read_text().splitlines():
+        try: rows.append(json.loads(line))
+        except Exception: continue
+    if args.since:
+        rows = [r for r in rows if r.get("ts","") >= args.since]
+    if not rows:
+        print(f"(ledger empty after filter)"); return
+
+    # Aggregation
+    grouped = {}
+    for r in rows:
+        if args.by == "agent": key = r.get("agent","?")
+        elif args.by == "day": key = (r.get("ts","") or "")[:10]
+        elif args.by == "cli": key = r.get("cli","?")
+        else: key = "total"
+        g = grouped.setdefault(key, {"n": 0, "input": 0, "output": 0, "total_tok": 0, "cost": 0.0, "elapsed": 0.0})
+        g["n"] += 1
+        u = r.get("usage") or {}
+        g["input"]     += u.get("input",0)
+        g["output"]    += u.get("output",0)
+        g["total_tok"] += u.get("total",0)
+        g["cost"]      += r.get("cost_usd",0) or 0
+        g["elapsed"]   += r.get("elapsed_s",0) or 0
+
+    if args.json:
+        print(json.dumps({"team": name, "since": args.since, "by": args.by, "groups": grouped}, ensure_ascii=False, indent=2))
+        return
+    label = args.by if args.by else "total"
+    print(f"\n━━━ cost ledger · team={name} · by={label}" + (f" · since={args.since}" if args.since else "") + " ━━━")
+    headers = f"  {label:<20s} {'tasks':>6s} {'input':>10s} {'output':>8s} {'total_tok':>10s} {'elapsed_s':>9s} {'cost_usd':>11s}"
+    print(headers); print("  " + "-"*len(headers))
+    sorted_keys = sorted(grouped.items(), key=lambda x: -x[1]["cost"])
+    grand = {"n":0,"input":0,"output":0,"total_tok":0,"elapsed":0.0,"cost":0.0}
+    for k, g in sorted_keys:
+        print(f"  {k:<20s} {g['n']:>6d} {g['input']:>10,d} {g['output']:>8,d} {g['total_tok']:>10,d} {g['elapsed']:>9.1f} ${g['cost']:>9.4f}")
+        for fld in ("n","input","output","total_tok","elapsed","cost"): grand[fld] += g[fld]
+    if len(sorted_keys) > 1:
+        print("  " + "-"*len(headers))
+        print(f"  {'TOTAL':<20s} {grand['n']:>6d} {grand['input']:>10,d} {grand['output']:>8,d} {grand['total_tok']:>10,d} {grand['elapsed']:>9.1f} ${grand['cost']:>9.4f}")
+
+def cmd_a2a_watch(args):
+    """Start a dedicated cmux observation workspace: top monitor strip + N follow panes.
+    Works regardless of whether teammates are in headless or dock mode.
+    v2.17. Uses a separate workspace (<team>-watch) so it doesn't collide with dock mode."""
+    name = args.name
+    cfg = load_json(config_path(name), None)
+    if not cfg: sys.exit(f"team {name} not found")
+    reg = _a2a_load_registry(name)
+    if not reg: sys.exit(f"team {name} not spawned yet — run `mmteam a2a spawn {name}` first")
+    members = [m for m in cfg.get("members", []) if m["id"] in reg]
+    if not members: sys.exit(f"no alive teammates in registry for {name}")
+    if len(members) > 6:
+        sys.exit(f"watch supports ≤6 panes, team has {len(members)} teammates. Use --agents filter.")
+
+    wsf = team_dir(name) / "watch-workspace.json"
+    if wsf.exists():
+        print(f"[watch] already running at workspace {load_json(wsf, {}).get('workspace','?')} — run `mmteam a2a unwatch {name}` first")
+        return
+
+    try:
+        ws = cmux_new_workspace(f"{name}-watch", cwd=os.getcwd())
+        cmux_select_workspace(ws); time.sleep(0.3)
+        print(f"  [WATCH] workspace={ws}")
+    except Exception as e:
+        sys.exit(f"cmux workspace failed: {e}")
+
+    # Create top strip for monitor; remember its pane/surface
+    orig_pane_id = cmux_list_panes(ws)[0] if cmux_list_panes(ws) else ""
+    panes_before = set(cmux_list_panes(ws))
+    cmux("new-split", "up", "--workspace", ws); time.sleep(0.3)
+    panes_after = cmux_list_panes(ws)
+    new_panes = [p for p in panes_after if p not in panes_before]
+    mon_pane = new_panes[0] if new_panes else panes_after[-1]
+    tree = cmux("tree", "--workspace", ws, "--json", capture=True) or "{}"
+    mon_surf = _find_surface_for_pane(tree, mon_pane)
+    # Back to original pane to build grid below
+    cmux_focus_pane(orig_pane_id, ws); time.sleep(0.2)
+
+    try:
+        cmux_build_grid(ws, len(members))
+    except Exception as e:
+        cmux_close_workspace(ws); sys.exit(f"grid build failed: {e}")
+    all_surfs = cmux_list_surfaces(ws)
+    teammate_surfs = [s for s in all_surfs if s != mon_surf][:len(members)]
+
+    save_json(wsf, {"workspace": ws, "monitor_surface": mon_surf,
+                    "teammate_surfaces": dict(zip([m["id"] for m in members], teammate_surfs))})
+
+    # Monitor strip: events
+    cmux("send", "--surface", mon_surf, "--workspace", ws,
+         f"{sys.executable} {A2A_MONITOR_SCRIPT} {name}")
+    cmux("send-key", "--surface", mon_surf, "--workspace", ws, "Return")
+    try: cmux("rename-tab", "--surface", mon_surf, "--workspace", ws, f"{name}/monitor")
+    except Exception: pass
+
+    # Each teammate pane: tail log
+    for m, surf in zip(members, teammate_surfs):
+        cmux("send", "--surface", surf, "--workspace", ws,
+             f"{sys.argv[0]} a2a follow {name} {m['id']}")
+        cmux("send-key", "--surface", surf, "--workspace", ws, "Return")
+        try: cmux("rename-tab", "--surface", surf, "--workspace", ws, f"{name}/{m['id']}")
+        except Exception: pass
+
+    print(f"\n✅ watch panel open. Switch to cmux workspace '{name}-watch'.")
+    print(f"   ({len(members)} teammate panes + 1 monitor strip)")
+    print(f"   To close: mmteam a2a unwatch {name}")
+
+def cmd_a2a_unwatch(args):
+    """Close the watch observation workspace for a team."""
+    name = args.name
+    wsf = team_dir(name) / "watch-workspace.json"
+    if not wsf.exists():
+        print(f"(no watch panel open for {name})"); return
+    try:
+        ws = load_json(wsf, {}).get("workspace","")
+        if ws: cmux_close_workspace(ws); print(f"  [WATCH-CLOSED] {ws}")
+    except Exception as e:
+        print(f"[WARN] close workspace: {e}")
+    finally:
+        wsf.unlink(missing_ok=True)
+
+def cmd_a2a_follow(args):
+    """Live-tail a teammate's a2a.log with colorization. Ctrl-C to stop."""
+    logp = team_dir(args.name) / f"{args.agent}.a2a.log"
+    if not logp.exists():
+        sys.exit(f"no log for {args.agent} (spawn the team first)")
+    CLR_TASK = "\033[36m"; CLR_STDERR = "\033[31m"; CLR_HDR = "\033[33;1m"; CLR_R = "\033[0m"
+    print(f"{CLR_HDR}━━━ follow {args.name}/{args.agent} ━━━{CLR_R}  (Ctrl-C to stop)")
+    try:
+        with open(logp) as f:
+            # Start from end
+            f.seek(0, 2)
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.3); continue
+                if "task=" in line: out = f"{CLR_TASK}{line.rstrip()}{CLR_R}"
+                elif "[stderr]" in line: out = f"{CLR_STDERR}{line.rstrip()}{CLR_R}"
+                elif line.startswith("[") and "]" in line[:40]: out = f"{CLR_HDR}{line.rstrip()}{CLR_R}"
+                else: out = line.rstrip()
+                print(out)
+    except KeyboardInterrupt:
+        print(f"\n{CLR_HDR}— follow stopped —{CLR_R}")
+
+def cmd_a2a_ls(args):
+    reg = _a2a_load_registry(args.name)
+    if not reg: print("(empty registry)"); return
+    for mid, e in reg.items():
+        alive = ""
+        if e.get("kind") == "local":
+            pf = a2a_pid_path(args.name, mid)
+            if pf.exists() and proc_alive(int(pf.read_text())): alive = " [alive]"
+            else: alive = " [dead]"
+        print(f"  {mid:12s} {e['kind']:6s} {e['url']}{alive}")
+
+# v2.15: Plan request caps per rolling 5-hour window.
+# Conservative defaults — users can run richer tiers (higher caps), these are the lowest-tier guards.
+# Adjust per real subscription via PLAN_CAPS override in ~/.claude/teams/<team>/config.json in future.
+_PLAN_CAPS_5H = {
+    "kimi":    300,    # Allegretto baseline (range 300-1200)
+    "glm":     200,    # GLM Coding Plan baseline
+    "doubao":  500,    # ark-code Coding Plan baseline
+    "qwen":    200,    # 百炼 baseline
+    "minimax": 300,    # Token Plan baseline
+    "mimo":    100,    # 小米 MiMo 探索包
+    "stepfun": 200,    # Step baseline
+    # Native APIs are typically pay-as-you-go — no hard 5h cap, use "inf"
+    "claude":  float("inf"),
+    "codex":   float("inf"),
+    "gemini":  float("inf"),
+    "claude-team": float("inf"),
+}
+
+def _quota_penalty(team: str, agent: str, cli: str) -> tuple:
+    """Return (penalty_multiplier, current_5h_reqs, cap).
+    penalty = 1.0 (headroom), 0.5 (>=80% used), 0.0 (>=95% — hard skip).
+    """
+    from datetime import datetime as _dt, timedelta
+    slug = cli[3:] if cli.startswith("cc-") else cli[:-5] if cli.endswith("-code") else cli
+    cap = _PLAN_CAPS_5H.get(slug, float("inf"))
+    if cap == float("inf"): return (1.0, 0, cap)
+    ledger = team_dir(team) / "cost-ledger.jsonl"
+    if not ledger.exists(): return (1.0, 0, cap)
+    now = _dt.now()
+    window_start = now - timedelta(hours=5)
+    n = 0
+    for line in ledger.read_text().splitlines():
+        try: r = json.loads(line)
+        except Exception: continue
+        if r.get("agent") != agent: continue
+        try:
+            if _dt.fromisoformat(r.get("ts","").split("+")[0]) >= window_start: n += 1
+        except Exception: continue
+    ratio = n / cap
+    if ratio >= 0.95: return (0.0, n, cap)
+    if ratio >= 0.80: return (0.5, n, cap)
+    return (1.0, n, cap)
+
+# v2.12: Token → USD pricing table (per-1M-tokens, 2026-04 public prices; quarterly refresh).
+# Slug used here matches _slug_of() output: "claude" / "codex" / "gemini" / CC clone slugs.
+# Subscription-based CC clones (kimi/glm/...) get an approximate $/M equivalent so
+# cost comparisons across families remain meaningful — users pay a flat plan, not these amounts.
+_PRICING = {
+    # Native families (true API pricing)
+    "claude":  {"in": 3.0,   "out": 15.0,  "cached": 0.30},   # Sonnet 4.6 rate
+    "codex":   {"in": 1.25,  "out": 10.0,  "cached": 0.13},   # GPT-5.4
+    "gemini":  {"in": 1.25,  "out": 10.0,  "cached": 0.31},   # Gemini 2.5 Pro
+    # CC clone families (subscription-priced IRL; rates shown are approximate equivalents)
+    "kimi":    {"in": 0.15,  "out": 2.50,  "cached": 0.02},
+    "glm":     {"in": 0.10,  "out": 1.00,  "cached": 0.01},
+    "doubao":  {"in": 0.10,  "out": 1.00,  "cached": 0.01},
+    "qwen":    {"in": 0.10,  "out": 1.00,  "cached": 0.01},
+    "minimax": {"in": 0.10,  "out": 1.00,  "cached": 0.01},
+    "mimo":    {"in": 0.10,  "out": 1.00,  "cached": 0.01},
+    "stepfun": {"in": 0.10,  "out": 1.00,  "cached": 0.01},
+    "claude-team": {"in": 3.0, "out": 15.0, "cached": 0.30},  # same as claude (its sidecars are Claude)
+}
+
+def _estimate_cost(usage: dict, slug: str) -> float:
+    """Return USD estimate for given token usage + CLI family. Returns 0 for unknown."""
+    p = _PRICING.get(slug)
+    if not p or not usage: return 0.0
+    # cached tokens are billed at cached rate; the rest of input at full rate
+    cached = usage.get("cached", 0) or 0
+    inp = (usage.get("input", 0) or 0) - cached  # non-cached input portion
+    if inp < 0: inp = 0
+    out = usage.get("output", 0) or 0
+    cost = (inp * p["in"] + cached * p["cached"] + out * p["out"]) / 1_000_000
+    return round(cost, 6)
+
+# Keyword → skill map for smart routing (ask command)
+_ASK_SKILL_KEYWORDS = {
+    "chinese-coding":   ["中文", "中国", "汉字", "简体", "繁体", "chinese"],
+    "long-context":     ["long", "long-context", "big file", "大文件", "summarize", "summary", "1m", "500k", "100k", "分析", "analyze"],
+    "algorithm-design": ["algorithm", "algo", "complexity", "optimal", "leetcode", "lc ", "big o", "dp ", "graph", "tree"],
+    "code-execution":   ["code", "program", "script", "python", "javascript", "typescript", "rust", "go ", "java ", "write", "implement", "function", "class"],
+    "doc-summary":      ["summarize", "summary", "tldr", "brief", "总结", "概括", "提炼"],
+    "multi-file-review":["review", "audit", "cross-file", "project", "repo", "全局", "审查", "代码审"],
+    "reasoning-effort": ["reason", "stepwise", "推导"],
+    "english-coding":   ["english"],
+    # v2.9: differentiated CC-clone routing keywords
+    "sql-engineering":  ["sql", "select ", "doris", "adb", "polardb", "mysql", "oracle", "查询", "数据库", "join ", "group by", "where"],
+    "fast-inference":   ["fast", "quick", "速度", "急", "立刻", "urgent", "asap", "immediately"],
+    "math-logic":       ["math", "数学", "prove", "proof", "证明", "逻辑", "equation", "theorem", "定理", "质数", "素数"],
+    "experimental-model":["实验", "新模型", "测试模型", "trial", "experimental", "explore"],
+    # v2.11: Claude agent-teams orchestrator
+    "parallel-sidecars":["parallel", "并行", "fan out", "fanout", "subteam", "sidecar", "team-create", "分身并行", "多角度"],
+    # provider-routing & claude/gemini/codex native-family skills are not keyword-triggered
+}
+
+def _ask_scores(team: str, text: str):
+    """Return (scores_dict, alive_list, quota_notes) — skill-keyword match scores per
+    alive teammate, with quota penalty applied (v2.15)."""
+    reg = _a2a_load_registry(team)
+    cfg = load_json(config_path(team), {}) or {}
+    id_to_cli = {m["id"]: m["cli"] for m in cfg.get("members", [])}
+    if not reg: return {}, [], {}
+    alive = []
+    for mid, e in reg.items():
+        if e.get("kind") == "local":
+            pf = a2a_pid_path(team, mid)
+            if pf.exists() and proc_alive(int(pf.read_text() or 0)):
+                alive.append(mid)
+        else: alive.append(mid)
+    if not alive: return {}, [], {}
+    low = text.lower()
+    scores = {mid: 0.0 for mid in alive}
+    quota_notes = {}
+    card_dir = team_dir(team) / "agent-cards"
+    for mid in alive:
+        raw = 0
+        cp = card_dir / f"{mid}.json"
+        if cp.exists():
+            try:
+                c = json.loads(cp.read_text())
+                for s in c.get("skills", []):
+                    sid = s.get("id", "")
+                    for kw in _ASK_SKILL_KEYWORDS.get(sid, []):
+                        if kw in low: raw += 1
+            except Exception: pass
+        penalty, cur, cap = _quota_penalty(team, mid, id_to_cli.get(mid, ""))
+        scores[mid] = raw * penalty
+        if cap != float("inf"):
+            quota_notes[mid] = {"used": cur, "cap": cap, "penalty": penalty,
+                                "pct": round(cur/cap*100, 1) if cap else 0}
+    return scores, alive, quota_notes
+
+def _a2a_send_blocking(team, agent, text):
+    """Helper: dispatch a send, return {id, state, text} or raise on error."""
+    url, tok = _a2a_resolve(team, agent)
+    params = {"message": {"role":"user","messageId":str(uuid.uuid4()),
+                          "parts":[{"kind":"text","text":text}]}}
+    resp = _a2a_rpc(url, tok, "message/send", params)
+    if "error" in resp: raise RuntimeError(f"{agent} error: {resp['error']}")
+    r = resp.get("result") or {}
+    out = ""
+    arts = r.get("artifacts") or []
+    if arts and arts[0].get("parts"):
+        for p in arts[0]["parts"]:
+            if p.get("kind") == "text": out = p.get("text",""); break
+    return {"task_id": r.get("id"), "state": (r.get("status") or {}).get("state","?"), "text": out}
+
+def cmd_a2a_pipeline(args):
+    """Sequential 3-stage workflow: writer → reviewer → synth.
+    writer answers the original prompt; reviewer critiques writer; synth consolidates.
+    Each stage consumes previous outputs via template substitution."""
+    name = args.name
+    reg = _a2a_load_registry(name)
+    if not reg: sys.exit(f"no registered teammates in {name}")
+    for role, aid in [("writer", args.writer), ("reviewer", args.reviewer), ("synth", args.synth)]:
+        if aid and aid not in reg: sys.exit(f"{role}='{aid}' not in registry")
+
+    def _log(msg):  # progress only in human mode
+        if not args.json: sys.stderr.write(msg + "\n")
+    def _emit_step_live(s):
+        if args.json: return
+        print(f"\n━━━ {s['role']} ({s['agent']}) [{s['state']}] task={s.get('task_id','')[:8]} ━━━")
+        print(s.get("text",""))
+
+    steps = []
+    # Stage 1: writer
+    _log(f"[pipeline] stage 1/3 writer={args.writer} ...")
+    w = _a2a_send_blocking(name, args.writer, args.text)
+    steps.append({"role": "writer", "agent": args.writer, **w})
+    _emit_step_live(steps[-1])
+    if w["state"] != "completed":
+        if args.json: _emit_pipeline(args, steps)
+        sys.exit(1)
+
+    r_prompt = (f"请审查下面由 {args.writer} 给出的回答。指出：正确性问题、改进点、遗漏。简洁不啰嗦。\n\n"
+                f"原问题：{args.text}\n\n"
+                f"{args.writer} 的回答：\n{w['text']}")
+    _log(f"[pipeline] stage 2/3 reviewer={args.reviewer} ...")
+    rv = _a2a_send_blocking(name, args.reviewer, r_prompt)
+    steps.append({"role": "reviewer", "agent": args.reviewer, **rv})
+    _emit_step_live(steps[-1])
+    if rv["state"] != "completed":
+        if args.json: _emit_pipeline(args, steps)
+        sys.exit(1)
+
+    s_prompt = (f"请整合下面的材料，给出最终高质量答案。融合 writer 的内容和 reviewer 的改进意见，去除啰嗦，保留关键信息。\n\n"
+                f"原问题：{args.text}\n\n"
+                f"[writer={args.writer}]\n{w['text']}\n\n"
+                f"[reviewer={args.reviewer}]\n{rv['text']}")
+    _log(f"[pipeline] stage 3/3 synth={args.synth} ...")
+    sy = _a2a_send_blocking(name, args.synth, s_prompt)
+    steps.append({"role": "synth", "agent": args.synth, **sy})
+    _emit_step_live(steps[-1])
+
+    if args.json: _emit_pipeline(args, steps)
+
+def _emit_pipeline(args, steps):
+    if args.json:
+        print(json.dumps({"team": args.name, "original": args.text, "steps": steps}, ensure_ascii=False, indent=2))
+    else:
+        for s in steps:
+            print(f"\n━━━ {s['role']} ({s['agent']}) [{s['state']}] task={s.get('task_id','')[:8]} ━━━")
+            print(s.get("text",""))
+
+def cmd_a2a_routes(args):
+    """Dry-run smart router: show which teammate ask would pick, why (scores + quota),
+    without actually sending the prompt. Zero quota cost."""
+    scores, alive, quota_notes = _ask_scores(args.name, args.text)
+    if not alive:
+        print(f"(no alive teammates in {args.name})"); return
+    best = max(scores.items(), key=lambda x: x[1])
+    chosen = best[0] if best[1] > 0 else sorted(alive)[0]
+    if args.json:
+        print(json.dumps({"team": args.name, "prompt": args.text,
+                          "would_route_to": chosen, "winning_score": best[1],
+                          "all_scores": scores, "quota": quota_notes}, ensure_ascii=False, indent=2))
+        return
+    print(f"\n━━━ dry-run route · team={args.name} ━━━")
+    print(f"  prompt: {args.text[:100]}{'...' if len(args.text)>100 else ''}")
+    print(f"\n  would route to: {chosen}" + (f"  (score={best[1]})" if best[1] > 0 else "  (no keyword match — alpha fallback)"))
+    print(f"\n  {'agent':<12s} {'score':>7s} {'quota':>14s}")
+    print("  " + "-"*40)
+    for aid, sc in sorted(scores.items(), key=lambda x: -x[1]):
+        q = quota_notes.get(aid)
+        qstr = f"{q['used']}/{q['cap']} ({q['pct']}%)" if q else "∞"
+        mark = " ★" if aid == chosen else "  "
+        print(f" {mark}{aid:<12s} {sc:>7.2f} {qstr:>14s}")
+
+def cmd_a2a_who(args):
+    """One-line team status: alive agents + their last-5h quota + last activity time."""
+    from datetime import datetime as _dt, timedelta
+    name = args.name
+    reg = _a2a_load_registry(name)
+    cfg = load_json(config_path(name), {}) or {}
+    if not reg:
+        print(f"(team {name} not spawned — run mmteam a2a spawn {name})"); return
+    id_to_cli = {m["id"]: m["cli"] for m in cfg.get("members", [])}
+    ledger = team_dir(name) / "cost-ledger.jsonl"
+    last_ts = {}  # agent → ISO
+    recent_5h = {}  # agent → count
+    if ledger.exists():
+        now = _dt.now(); win = now - timedelta(hours=5)
+        for line in ledger.read_text().splitlines():
+            try: r = json.loads(line)
+            except Exception: continue
+            aid = r.get("agent","?")
+            last_ts[aid] = r.get("ts", last_ts.get(aid,""))
+            try:
+                if _dt.fromisoformat(r.get("ts","").split("+")[0]) >= win:
+                    recent_5h[aid] = recent_5h.get(aid, 0) + 1
+            except Exception: pass
+    print(f"\n━━━ who · team={name} ━━━")
+    for mid, e in reg.items():
+        cli = id_to_cli.get(mid, "")
+        slug = cli[3:] if cli.startswith("cc-") else cli[:-5] if cli.endswith("-code") else cli
+        cap = _PLAN_CAPS_5H.get(slug, float("inf"))
+        alive_mark = ""
+        if e.get("kind") == "local":
+            pf = a2a_pid_path(name, mid)
+            alive_mark = "✅" if pf.exists() and proc_alive(int(pf.read_text() or 0)) else "⚫"
+        else: alive_mark = "🌐"
+        used = recent_5h.get(mid, 0)
+        qstr = f"{used}/{'∞' if cap==float('inf') else cap}" + (f" ({round(used/cap*100)}%)" if cap != float("inf") and cap else "")
+        last = last_ts.get(mid, "-")[:19].replace("T", " ") if last_ts.get(mid) else "-"
+        print(f"  {alive_mark} {mid:<12s} {cli:<15s} 5h={qstr:<15s} last={last}")
+
+def cmd_a2a_ask(args):
+    """Smart route: pick best teammate by skill match, then send.
+    v2.15: teammates at >=80% of their 5h quota are penalized (score *= 0.5), >=95% skipped."""
+    scores, alive, quota_notes = _ask_scores(args.name, args.text)
+    if not alive: sys.exit(f"no alive teammate in {args.name}")
+    # Warn on constrained teammates
+    for mid, q in quota_notes.items():
+        if q["penalty"] < 1.0:
+            sys.stderr.write(f"[quota-warn] {mid}: {q['used']}/{q['cap']} ({q['pct']}%) — penalty×{q['penalty']}\n")
+    best = max(scores.items(), key=lambda x: x[1])
+    aid = best[0] if best[1] > 0 else sorted(alive)[0]
+    url, tok = _a2a_resolve(args.name, aid)
+    params = {"message": {"role": "user", "messageId": str(uuid.uuid4()),
+        "parts": [{"kind": "text", "text": args.text}]}}
+    resp = _a2a_rpc(url, tok, "message/send", params)
+    if "error" in resp:
+        print(json.dumps(resp, ensure_ascii=False, indent=2)); sys.exit(1)
+    r = resp["result"]
+    arts = r.get("artifacts") or []
+    text_out = ""
+    if arts and arts[0].get("parts"):
+        for p in arts[0]["parts"]:
+            if p.get("kind") == "text": text_out = p.get("text",""); break
+    print(json.dumps({
+        "routed_to": aid,
+        "score": scores.get(aid, 0),
+        "all_scores": scores,
+        "quota": quota_notes,
+        "id": r.get("id"),
+        "status": (r.get("status") or {}).get("state"),
+        "text": text_out,
+    }, ensure_ascii=False, indent=2))
+
+def cmd_a2a_fanout(args):
+    """Dispatch one prompt to N teammates in parallel; collect all results.
+    Use case: cross-model validation, same-question broadcast, consensus check."""
+    import concurrent.futures as _cf
+    name = args.name
+    reg = _a2a_load_registry(name)
+    cfg = load_json(config_path(name), {}) or {}
+    if not reg: sys.exit(f"no registered teammates in team {name}")
+    targets = [a.strip() for a in args.agents.split(",")] if args.agents else list(reg.keys())
+    # If --judge is specified and --agents NOT explicitly given, auto-exclude judge from fanout
+    if getattr(args, "judge", "") and not args.agents:
+        targets = [t for t in targets if t != args.judge]
+    missing = [a for a in targets if a not in reg]
+    if missing: sys.exit(f"unknown teammate(s): {missing}")
+    if getattr(args, "judge", "") and args.judge not in reg:
+        sys.exit(f"judge '{args.judge}' not registered in {name}")
+
+    # v2.15: Skip teammates at/near quota cap (>=95%) unless --no-skip-full
+    id_to_cli = {m["id"]: m["cli"] for m in cfg.get("members", [])}
+    skipped_for_quota = {}
+    if not getattr(args, "no_skip_full", False) and not args.agents:  # only auto-skip when user didn't specify targets
+        kept = []
+        for t in targets:
+            penalty, cur, cap = _quota_penalty(name, t, id_to_cli.get(t, ""))
+            if penalty == 0.0:
+                skipped_for_quota[t] = {"used": cur, "cap": cap}
+                sys.stderr.write(f"[quota-skip] {t}: {cur}/{cap} (≥95%) — auto-dropped from fanout\n")
+            else:
+                kept.append(t)
+                if penalty < 1.0:
+                    sys.stderr.write(f"[quota-warn] {t}: {cur}/{cap} ({round(cur/cap*100,1)}%)\n")
+        targets = kept
+    if not targets:
+        sys.exit(f"all teammates over quota in team {name}. Use --no-skip-full to force.")
+
+    def _dispatch(aid):
+        url, tok = _a2a_resolve(name, aid)
+        params = {"message": {"role":"user","messageId":str(uuid.uuid4()),
+                              "parts":[{"kind":"text","text":args.text}]}}
+        resp = _a2a_rpc(url, tok, "message/send", params)
+        return aid, resp
+
+    # Map agent id → CLI slug for pricing lookup
+    agent_to_slug = {m["id"]: (m["cli"][3:] if m["cli"].startswith("cc-")
+                                else m["cli"][:-5] if m["cli"].endswith("-code")
+                                else m["cli"])
+                     for m in cfg.get("members", [])}
+
+    def _to_summary(aid, resp):
+        if "error" in resp:
+            return {"agent": aid, "state": "error",
+                    "text": json.dumps(resp.get("error"), ensure_ascii=False)}
+        res = resp.get("result", {}) or {}
+        text = ""
+        arts = res.get("artifacts") or []
+        if arts and arts[0].get("parts"):
+            for p in arts[0]["parts"]:
+                if p.get("kind") == "text": text = p.get("text",""); break
+        usage = res.get("usage", {}) or {}
+        return {"agent": aid, "state": (res.get("status") or {}).get("state","?"),
+                "task_id": res.get("id",""), "text": text,
+                "usage": usage, "elapsed_s": res.get("elapsed_s"),
+                "estimated_cost_usd": _estimate_cost(usage, agent_to_slug.get(aid, ""))}
+
+    # As each future completes, either stash (JSON mode: wait for full order)
+    # or emit immediately (human mode: live progress).
+    results_by_agent = {}
+    with _cf.ThreadPoolExecutor(max_workers=min(len(targets), 10)) as exe:
+        futs = {exe.submit(_dispatch, a): a for a in targets}
+        for f in _cf.as_completed(futs):
+            aid, resp = f.result()
+            s = _to_summary(aid, resp)
+            results_by_agent[aid] = s
+            if not args.json:
+                tid = s.get('task_id','')[:8] if s.get('task_id') else ""
+                u = s.get('usage') or {}
+                ustr = f"  ({u.get('input',0)}+{u.get('output',0)}={u['total']}tok, {s.get('elapsed_s','?')}s)" if u.get('total') else ""
+                print(f"\n=== {s['agent']}  [{s['state']}]  task={tid}{ustr} ===")
+                print(s['text'])
+
+    summary = [results_by_agent.get(aid, {"agent": aid, "state": "?", "text": ""}) for aid in targets]
+
+    analysis = _fanout_analyze(summary)
+
+    # Optional: semantic synthesis by a judge teammate (Claude-as-judge pattern)
+    if getattr(args, "judge", "") and args.judge in reg:
+        done = [s for s in summary if s.get("state") == "completed" and s.get("text")]
+        if len(done) >= 2 and args.judge not in [d["agent"] for d in done]:
+            # Judge wasn't one of the respondents (clean separation of concerns)
+            answers_block = "\n\n".join(f"[{d['agent']}]\n{d['text'].strip()}" for d in done)
+            judge_prompt = (
+                f"以下是 {len(done)} 个不同模型对同一问题的回答。请做 3 件事（用中文，简短）：\n"
+                f"1. 是否存在明显错误或分歧？指出哪个模型跑偏了（如有）\n"
+                f"2. 给一个融合多家优点的共识版本\n"
+                f"3. 一句话总评每家风格\n\n"
+                f"问题：{args.text}\n\n"
+                f"回答：\n{answers_block}"
+            )
+            judge_url, judge_tok = _a2a_resolve(name, args.judge)
+            jresp = _a2a_rpc(judge_url, judge_tok, "message/send",
+                {"message":{"role":"user","messageId":str(uuid.uuid4()),
+                            "parts":[{"kind":"text","text":judge_prompt}]}})
+            jres = jresp.get("result") or {}
+            jtext = ""
+            jarts = jres.get("artifacts") or []
+            if jarts and jarts[0].get("parts"):
+                for p in jarts[0]["parts"]:
+                    if p.get("kind") == "text": jtext = p.get("text",""); break
+            analysis["judge"] = {"agent": args.judge, "task_id": jres.get("id",""),
+                                 "state": (jres.get("status") or {}).get("state","?"),
+                                 "text": jtext}
+        elif args.judge in [d["agent"] for d in done]:
+            analysis["judge_skipped"] = "judge is a respondent — skipped to keep separation"
+
+    if args.json:
+        print(json.dumps({"results": summary, "analysis": analysis}, ensure_ascii=False, indent=2))
+    else:
+        # Per-agent outputs already printed incrementally above; now print analysis
+        # Aggregate usage across all fanout respondents (plan-based users, no USD)
+        total_in = sum((s.get('usage') or {}).get('input',0) for s in summary)
+        total_out = sum((s.get('usage') or {}).get('output',0) for s in summary)
+        total_tok = sum((s.get('usage') or {}).get('total',0) for s in summary)
+        if total_tok and not args.json:
+            print(f"\n--- usage totals (across {len(summary)} agents) ---")
+            print(f"  input={total_in:,}  output={total_out:,}  total={total_tok:,} tokens  (reqs={len(summary)})")
+        if analysis.get("pairs") and not args.json:
+            print(f"  consensus_score: {analysis['consensus_score']:.2f}  ({analysis['consensus_label']})")
+            for a, b, sim in analysis["pairs"]:
+                print(f"  sim({a}, {b}) = {sim:.2f}")
+            if analysis.get("outlier"):
+                print(f"  ⚠ outlier: {analysis['outlier']} (avg_sim={analysis['outlier_avg']:.2f})")
+        if analysis.get("judge"):
+            j = analysis["judge"]
+            print(f"\n--- judge: {j['agent']} ({j['state']}) ---")
+            print(j["text"])
+
+def _fanout_analyze(summary):
+    """Compute pairwise Jaccard similarity across completed responses;
+    flag the outlier (lowest mean similarity) if significantly below others.
+    Tokens = ASCII words + CJK char-bigrams (handles Chinese without spaces)."""
+    import re as _re
+    def tokens(s):
+        t = set(_re.findall(r'[a-zA-Z][a-zA-Z0-9_]*', s.lower()))
+        cjk = _re.findall(r'[\u4e00-\u9fff]+', s)
+        for run in cjk:
+            t.update(run[i:i+2] for i in range(len(run)-1))  # char bigrams
+            t.update(c for c in run)  # single chars also help short strings
+        return t
+    done = [(s["agent"], s["text"]) for s in summary if s.get("state") == "completed" and s.get("text")]
+    if len(done) < 2: return {"pairs": [], "consensus_score": 1.0 if done else 0.0, "consensus_label": "n/a"}
+    toks = {a: tokens(t) for a, t in done}
+    pairs = []
+    avg = {a: 0.0 for a, _ in done}
+    cnt = {a: 0 for a, _ in done}
+    ids = [a for a, _ in done]
+    for i in range(len(ids)):
+        for j in range(i+1, len(ids)):
+            a, b = ids[i], ids[j]
+            u = toks[a] | toks[b]
+            sim = (len(toks[a] & toks[b]) / len(u)) if u else 0.0
+            pairs.append([a, b, round(sim, 3)])
+            avg[a] += sim; cnt[a] += 1
+            avg[b] += sim; cnt[b] += 1
+    for k in avg: avg[k] = avg[k] / cnt[k] if cnt[k] else 0.0
+    consensus = sum(p[2] for p in pairs) / len(pairs)
+    label = ("high-consensus" if consensus >= 0.5 else
+             "moderate-consensus" if consensus >= 0.25 else
+             "low-consensus")
+    outlier = None; outlier_avg = 0.0
+    if len(avg) >= 3:
+        sorted_avg = sorted(avg.items(), key=lambda x: x[1])
+        worst_a, worst_v = sorted_avg[0]
+        next_v = sorted_avg[1][1]
+        if next_v - worst_v > 0.15:  # significantly below the rest
+            outlier = worst_a; outlier_avg = round(worst_v, 3)
+    return {"pairs": pairs, "consensus_score": round(consensus, 3),
+            "consensus_label": label, "outlier": outlier, "outlier_avg": outlier_avg,
+            "avg_similarity": {k: round(v, 3) for k, v in avg.items()}}
+
+# ────── argparse ──────
+def main():
+    ap = argparse.ArgumentParser(prog="mmteam")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sp.add_parser("create"); p.add_argument("name"); p.add_argument("members", nargs="+"); p.add_argument("--lead", default=""); p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_create)
+
+    p = sp.add_parser("spawn"); p.add_argument("name"); p.add_argument("--dock", action="store_true", help="Launch teammates in cmux dock tabs (visible TUI)")
+    p.set_defaults(fn=cmd_spawn)
+    p = sp.add_parser("stop");  p.add_argument("name"); p.set_defaults(fn=cmd_stop)
+    p = sp.add_parser("destroy"); p.add_argument("name"); p.set_defaults(fn=cmd_destroy)
+    p = sp.add_parser("status"); p.add_argument("name"); p.set_defaults(fn=cmd_status)
+
+    p = sp.add_parser("tasks"); p.add_argument("name")
+    sp2 = p.add_subparsers(dest="action", required=True)
+    a = sp2.add_parser("add"); a.add_argument("desc"); a.add_argument("--to", default="")
+    a = sp2.add_parser("list")
+    a = sp2.add_parser("assign"); a.add_argument("task_id"); a.add_argument("agent_id")
+    p.set_defaults(fn=cmd_tasks)
+
+    p = sp.add_parser("msg"); p.add_argument("name"); p.add_argument("--from", dest="from_", required=True); p.add_argument("--to", required=True); p.add_argument("text")
+    p.set_defaults(fn=cmd_msg)
+
+    p = sp.add_parser("inbox"); p.add_argument("name"); p.add_argument("agent_id")
+    p.set_defaults(fn=cmd_inbox)
+
+    # Hidden daemon modes
+    p = sp.add_parser("daemon"); p.add_argument("name"); p.add_argument("agent_id")
+    p.set_defaults(fn=lambda a: run_daemon(a.name, a.agent_id))
+    p = sp.add_parser("daemon-dock"); p.add_argument("name"); p.add_argument("agent_id")
+    p.set_defaults(fn=lambda a: run_daemon_dock(a.name, a.agent_id))
+
+    # ── A2A subcommands ──
+    pa = sp.add_parser("a2a", help="A2A-protocol HTTP mode (remote-callable teammates)")
+    sp_a2a = pa.add_subparsers(dest="a2a_cmd", required=True)
+    x = sp_a2a.add_parser("spawn"); x.add_argument("name"); x.add_argument("--port", type=int, default=0)
+    x.add_argument("--dock", action="store_true", help="Each teammate in its own cmux pane (multi-pane grid, visible TUI, stateful session)")
+    x.add_argument("--monitor", action="store_true", help="Add a top-strip monitor pane that tails A2A task events (requires --dock)")
+    x.set_defaults(fn=cmd_a2a_spawn)
+    x = sp_a2a.add_parser("stop"); x.add_argument("name")
+    x.set_defaults(fn=cmd_a2a_stop)
+    x = sp_a2a.add_parser("ls"); x.add_argument("name")
+    x.set_defaults(fn=cmd_a2a_ls)
+    x = sp_a2a.add_parser("follow", help="Live-tail a teammate's a2a daemon log (progress during long tasks)")
+    x.add_argument("name"); x.add_argument("agent")
+    x.set_defaults(fn=cmd_a2a_follow)
+    x = sp_a2a.add_parser("watch", help="Open multi-pane cmux observation workspace (N follow panes + 1 monitor strip)")
+    x.add_argument("name")
+    x.set_defaults(fn=cmd_a2a_watch)
+    x = sp_a2a.add_parser("unwatch", help="Close the watch observation workspace for a team")
+    x.add_argument("name")
+    x.set_defaults(fn=cmd_a2a_unwatch)
+    x = sp_a2a.add_parser("cost", help="Aggregate persisted cost ledger (tokens + USD per completed task)")
+    x.add_argument("name")
+    x.add_argument("--since", default="", help="ISO date/time prefix filter, e.g. 2026-04-16")
+    x.add_argument("--by", choices=["agent","day","cli"], default="", help="Grouping dimension (default: total)")
+    x.add_argument("--json", action="store_true")
+    x.set_defaults(fn=cmd_a2a_cost)
+    x = sp_a2a.add_parser("quota", help="Rolling-window request count per teammate (for subscription plan users)")
+    x.add_argument("name")
+    x.add_argument("--json", action="store_true")
+    x.set_defaults(fn=cmd_a2a_quota)
+    x = sp_a2a.add_parser("card"); x.add_argument("name"); x.add_argument("agent")
+    x.set_defaults(fn=cmd_a2a_card)
+    x = sp_a2a.add_parser("send"); x.add_argument("name"); x.add_argument("agent"); x.add_argument("text")
+    x.add_argument("--session", default="", help="contextId for multi-turn chain (same id → server prepends prior turns)")
+    x.set_defaults(fn=cmd_a2a_send)
+    x = sp_a2a.add_parser("fanout", help="Dispatch same prompt to N teammates in parallel (cross-model compare)")
+    x.add_argument("name"); x.add_argument("text")
+    x.add_argument("--agents", default="", help="Comma-separated teammate ids (default: all)")
+    x.add_argument("--judge", default="", help="Teammate id to act as synthesis judge (will NOT be in fanout; reviews others' answers)")
+    x.add_argument("--json", action="store_true", help="Output structured JSON array instead of human format")
+    x.add_argument("--no-skip-full", action="store_true", help="Don't auto-drop teammates at >=95%% of 5h quota")
+    x.set_defaults(fn=cmd_a2a_fanout)
+    x = sp_a2a.add_parser("ask", help="Smart-route: pick best teammate by skill match and send")
+    x.add_argument("name"); x.add_argument("text")
+    x.set_defaults(fn=cmd_a2a_ask)
+    x = sp_a2a.add_parser("routes", help="Dry-run router: show who would win + why (zero quota cost)")
+    x.add_argument("name"); x.add_argument("text")
+    x.add_argument("--json", action="store_true")
+    x.set_defaults(fn=cmd_a2a_routes)
+    x = sp_a2a.add_parser("who", help="One-line team status: alive + 5h quota + last activity")
+    x.add_argument("name")
+    x.set_defaults(fn=cmd_a2a_who)
+    x = sp_a2a.add_parser("pipeline", help="3-stage sequential: writer → reviewer → synth")
+    x.add_argument("name"); x.add_argument("text")
+    x.add_argument("--writer", required=True)
+    x.add_argument("--reviewer", required=True)
+    x.add_argument("--synth", required=True)
+    x.add_argument("--json", action="store_true")
+    x.set_defaults(fn=cmd_a2a_pipeline)
+    x = sp_a2a.add_parser("get"); x.add_argument("name"); x.add_argument("agent"); x.add_argument("task_id")
+    x.set_defaults(fn=cmd_a2a_get)
+    x = sp_a2a.add_parser("cancel"); x.add_argument("name"); x.add_argument("agent"); x.add_argument("task_id")
+    x.set_defaults(fn=cmd_a2a_cancel)
+    x = sp_a2a.add_parser("register"); x.add_argument("name"); x.add_argument("agent"); x.add_argument("url"); x.add_argument("--token", required=True)
+    x.set_defaults(fn=cmd_a2a_register)
+    x = sp_a2a.add_parser("discover"); x.add_argument("url")
+    x.set_defaults(fn=cmd_a2a_discover)
+
+    args = ap.parse_args()
+    args.fn(args)
+
+if __name__ == "__main__":
+    main()
