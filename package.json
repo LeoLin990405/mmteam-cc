@@ -1,0 +1,31 @@
+{
+  "name": "mmteam-cc",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-Model Agent Teams for Claude Code · A2A v0.3 + MCP bridge · 10 backends",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/LeoLin990405/mmteam-cc",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LeoLin990405/mmteam-cc.git"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "multi-model",
+    "a2a",
+    "mcp",
+    "agent-teams",
+    "chinese-models"
+  ],
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "install:tools": "bash install.sh",
+    "uninstall:tools": "bash uninstall.sh",
+    "doctor": "bash doctor.sh",
+    "sync:dev": "bash scripts/sync-from-dev.sh"
+  }
+}

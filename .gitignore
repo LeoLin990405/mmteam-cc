@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Editor
+.idea/
+.vscode/
+*.sublime-*
+
+# Node (for .mjs scripts)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp.*
+
+# Build / dist
+dist/
+build/
+*.egg-info/
+
+# Local config backups created by install.sh
+*.bak-[0-9]*
+
+# Ephemeral runtime (teams data lives under ~/.claude/teams/, not in repo)
+/.claude/
+/scratch/
