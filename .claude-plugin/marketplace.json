@@ -1,0 +1,32 @@
+{
+  "name": "mmteam-cc",
+  "owner": {
+    "name": "LeoLin990405"
+  },
+  "metadata": {
+    "description": "Multi-Model Agent Teams for Claude Code. Orchestrate 10 AI CLIs (Kimi / GLM / Doubao / Qwen / MiniMax / MiMo / StepFun / Codex / Gemini / Claude) via Google A2A v0.3 HTTP protocol and MCP bridge. Supports fanout consensus, write→review→synth pipelines, cross-host teammates, and per-family -team sidecars.",
+    "version": "2.0.0",
+    "homepage": "https://github.com/LeoLin990405/mmteam-cc",
+    "license": "Apache-2.0"
+  },
+  "plugins": [
+    {
+      "name": "mmteam",
+      "description": "Multi-model agent teams — A2A HTTP daemons + MCP bridge + 13 slash commands for orchestrating 10 CLI backends.",
+      "version": "2.0.0",
+      "author": {
+        "name": "LeoLin990405"
+      },
+      "source": "./plugins/mmteam",
+      "keywords": [
+        "multi-model",
+        "a2a",
+        "mcp",
+        "agent-teams",
+        "fanout",
+        "consensus",
+        "pipeline"
+      ]
+    }
+  ]
+}
