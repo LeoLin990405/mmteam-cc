@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.0.1 (2026-04-17)
+
+### Added
+- **Brain mode** — `mmteam-orchestrator` agent gains autonomous multi-step workflow: decompose → dispatch → cross-review → retry → synthesize
+- **`/mmteam:brain`** — slash command to activate brain mode (CC as project manager)
+- **`/mmteam:supervise`** — slash command for CLI-driven autonomous supervisor loop
+- **`mmteam a2a supervise`** — CLI subcommand with `--max-retries`, `--cost-ceiling`, `--no-review`, `--no-synth`, `--subtasks-file`, `--json`
+- **Cross-review matrix** — automatic reviewer selection based on model family diversity
+- **ROADMAP.md** — full iteration plan v2.1–v2.6
+
+### Fixed
+- `mmteam status` crash on A2A tasks (dict status + missing desc fields)
+
 ## v2.0.0 (2026-04-17)
 
 **First public release** — extracts mmteam v2.18 from `~/bin/` into a standalone Claude Code plugin.
