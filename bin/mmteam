@@ -45,6 +45,10 @@ def save_json(p, d):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
 
+# Import KeyValueStore from external module
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from mmteam.kvstore import kv_store, KeyValueStore
+
 # ────── CLI command builders for headless call ──────
 def build_headless_cmd(cli: str, model: str, prompt_file: str):
     """返回 subprocess 可跑的命令列表，headless 读取 prompt_file"""
@@ -162,11 +166,24 @@ def cmd_status(args):
         print(f"  [{alive}] {m['id']:<12} {m['cli']:<12} {model:<25} inbox={inbox_n}")
     tasks = load_json(tasks_path(name), {"tasks":[]})["tasks"]
     by_status = {}
-    for t in tasks: by_status[t["status"]] = by_status.get(t["status"],0) + 1
+    for t in tasks:
+        st = t["status"]
+        st_key = st["state"] if isinstance(st, dict) else st
+        by_status[st_key] = by_status.get(st_key, 0) + 1
     print(f"\nTasks ({len(tasks)}): " + " · ".join(f"{k}={v}" for k,v in by_status.items()))
     for t in tasks[-10:]:
-        marker = {"pending":"○","in_progress":"◐","completed":"●","failed":"✗"}.get(t["status"],"?")
-        print(f"  {marker} [{t['id']}] {t.get('owner','?'):<10} {t['desc'][:70]}")
+        st = t["status"]
+        st_key = st["state"] if isinstance(st, dict) else st
+        marker = {"pending":"○","in_progress":"◐","completed":"●","failed":"✗"}.get(st_key,"?")
+        desc = t.get('desc') or t.get('description') or ''
+        if not desc:
+            hist = t.get('history', [])
+            if hist:
+                parts = hist[0].get('parts', [])
+                desc = parts[0].get('text', '') if parts else ''
+        desc = desc[:70] or '(no desc)'
+        owner = t.get('owner') or t.get('contextId', '?')[:8]
+        print(f"  {marker} [{t['id'][:8]}] {owner:<10} {desc}")
 
 def proc_alive(pid):
     try: os.kill(pid, 0); return True
@@ -1529,6 +1546,283 @@ def _fanout_analyze(summary):
             "consensus_label": label, "outlier": outlier, "outlier_avg": outlier_avg,
             "avg_similarity": {k: round(v, 3) for k, v in avg.items()}}
 
+# ────── supervise (brain loop) ──────
+
+_REVIEW_MATRIX = {
+    "kimi": ["glm", "doubao", "codex", "gemini"],
+    "glm": ["kimi", "doubao", "codex", "gemini"],
+    "doubao": ["kimi", "glm", "codex", "gemini"],
+    "qwen": ["kimi", "glm", "codex", "gemini"],
+    "minimax": ["kimi", "glm", "codex", "gemini"],
+    "mimo": ["kimi", "glm", "codex", "gemini"],
+    "stepfun": ["kimi", "glm", "codex", "gemini"],
+    "codex": ["gemini", "kimi", "glm"],
+    "gemini": ["codex", "kimi", "glm"],
+    "claude": ["codex", "gemini", "kimi"],
+}
+
+def _pick_reviewer(writer_id, alive_set):
+    """Pick best reviewer for a writer from alive agents, using cross-review matrix."""
+    base = writer_id.replace("-code", "").replace("-team", "")
+    candidates = _REVIEW_MATRIX.get(base, [])
+    for c in candidates:
+        for a in alive_set:
+            if a == writer_id:
+                continue
+            if a.startswith(c) or a == c:
+                return a
+    for a in alive_set:
+        if a != writer_id:
+            return a
+    return None
+
+def _supervise_decompose(team, text, alive):
+    """Use the first alive teammate to decompose a task into subtasks.
+    Returns list of {desc, suggested_agent} dicts."""
+    agent = alive[0]
+    prompt = (
+        f"请将以下任务分解为 1-5 个独立子任务。每个子任务用一行描述，格式：\n"
+        f"<agent>: <description>\n\n"
+        f"可选的 agent：{', '.join(alive)}\n"
+        f"根据每个子任务的性质选择最合适的 agent。\n"
+        f"只输出子任务列表，不要其他文字。\n\n"
+        f"任务：{text}"
+    )
+    r = _a2a_send_blocking(team, agent, prompt)
+    subtasks = []
+    for line in r["text"].strip().splitlines():
+        line = line.strip().lstrip("0123456789.-) ")
+        if ":" in line:
+            parts = line.split(":", 1)
+            suggested = parts[0].strip()
+            desc = parts[1].strip()
+            if suggested not in alive:
+                suggested = alive[0]
+            subtasks.append({"desc": desc, "agent": suggested})
+        elif line:
+            subtasks.append({"desc": line, "agent": alive[0]})
+    return subtasks[:5] or [{"desc": text, "agent": alive[0]}]
+
+def _supervise_review(team, writer_id, subtask_desc, output_text, reviewer_id):
+    """Send output to reviewer. Returns {score, feedback, passed}."""
+    prompt = (
+        f"请审查以下输出（由 {writer_id} 完成）。\n\n"
+        f"原始任务：{subtask_desc}\n\n"
+        f"输出：\n{output_text[:8000]}\n\n"
+        f"请打分（1-10）并给出简短反馈。格式：\n"
+        f"分数：X/10\n"
+        f"反馈：<一句话>"
+    )
+    r = _a2a_send_blocking(team, reviewer_id, prompt)
+    txt = r.get("text", "")
+    score = 7
+    import re
+    m = re.search(r'(\d+)\s*/\s*10', txt)
+    if m:
+        score = int(m.group(1))
+    return {"score": score, "feedback": txt, "passed": score >= 7}
+
+def cmd_a2a_supervise(args):
+    """Brain loop: decompose → dispatch → cross-review → retry → synthesize."""
+    import concurrent.futures as _cf
+    name = args.name
+    reg = _a2a_load_registry(name)
+    cfg = load_json(config_path(name), {}) or {}
+    if not reg:
+        sys.exit(f"no registered teammates in {name}. Run: mmteam a2a spawn {name}")
+    id_to_cli = {m["id"]: m["cli"] for m in cfg.get("members", [])}
+
+    alive = []
+    for mid, e in reg.items():
+        if e.get("kind") == "local":
+            pf = a2a_pid_path(name, mid)
+            if pf.exists() and proc_alive(int(pf.read_text() or 0)):
+                alive.append(mid)
+        else:
+            alive.append(mid)
+    if not alive:
+        sys.exit(f"no alive teammates in {name}")
+
+    text = args.text
+    max_retries = args.max_retries
+    cost_ceiling = args.cost_ceiling
+
+    def _log(msg):
+        sys.stderr.write(msg + "\n")
+
+    _log(f"\n━━━ SUPERVISE · team={name} · agents={len(alive)} ━━━")
+    _log(f"Task: {text[:120]}{'...' if len(text) > 120 else ''}")
+
+    # Step 1: Decompose
+    _log(f"\n[1/4] Decomposing task...")
+    if args.subtasks_file:
+        import pathlib
+        raw = pathlib.Path(args.subtasks_file).read_text()
+        subtasks = []
+        for line in raw.strip().splitlines():
+            line = line.strip().lstrip("0123456789.-) ")
+            if ":" in line:
+                parts = line.split(":", 1)
+                subtasks.append({"desc": parts[1].strip(), "agent": parts[0].strip()})
+            elif line:
+                subtasks.append({"desc": line, "agent": alive[0]})
+        subtasks = subtasks[:10]
+    else:
+        subtasks = _supervise_decompose(name, text, alive)
+
+    for i, st in enumerate(subtasks):
+        if st["agent"] not in alive:
+            st["agent"] = alive[i % len(alive)]
+        _log(f"  [{i+1}] {st['agent']}: {st['desc'][:80]}")
+
+    # Step 2: Dispatch + Review loop
+    _log(f"\n[2/4] Dispatching {len(subtasks)} subtasks...")
+    results = []
+    total_cost = 0.0
+    alive_set = set(alive)
+
+    for i, st in enumerate(subtasks):
+        agent = st["agent"]
+        desc = st["desc"]
+        attempt = 0
+        accepted = False
+        last_output = ""
+        reviewer_id = _pick_reviewer(agent, alive_set)
+        review_info = {"reviewer": reviewer_id, "score": 0, "attempts": 0}
+
+        while attempt <= max_retries and not accepted:
+            attempt += 1
+            retry_hint = ""
+            if attempt > 1 and review_info.get("feedback"):
+                retry_hint = f"\n\n[重试提示 — 上次审查反馈]：{review_info['feedback'][:500]}"
+
+            _log(f"  [{i+1}] attempt {attempt}/{max_retries+1}: {agent} → {desc[:60]}")
+            try:
+                r = _a2a_send_blocking(name, agent, desc + retry_hint)
+            except RuntimeError as e:
+                _log(f"  [{i+1}] ERROR: {e}")
+                results.append({"subtask": desc, "agent": agent, "state": "failed",
+                                "text": str(e), "review": review_info, "attempts": attempt})
+                break
+
+            last_output = r.get("text", "")
+            if r["state"] != "completed":
+                _log(f"  [{i+1}] state={r['state']}, retrying...")
+                continue
+
+            usage = {}
+            slug = id_to_cli.get(agent, "")[3:] if id_to_cli.get(agent, "").startswith("cc-") else id_to_cli.get(agent, "").replace("-code", "")
+            total_cost += _estimate_cost(usage, slug)
+
+            if cost_ceiling > 0 and total_cost > cost_ceiling:
+                _log(f"\n⚠️  Cost ceiling ${cost_ceiling:.2f} exceeded (${total_cost:.4f}). Stopping.")
+                results.append({"subtask": desc, "agent": agent, "state": "completed",
+                                "text": last_output, "review": {"reviewer": None, "score": 0, "skipped": "cost_ceiling"},
+                                "attempts": attempt})
+                accepted = True
+                break
+
+            # Cross-review
+            if reviewer_id and not args.no_review:
+                _log(f"  [{i+1}] reviewing: {reviewer_id}")
+                try:
+                    rev = _supervise_review(name, agent, desc, last_output, reviewer_id)
+                    review_info = {"reviewer": reviewer_id, "score": rev["score"],
+                                   "feedback": rev["feedback"], "attempts": attempt}
+                    if rev["passed"]:
+                        _log(f"  [{i+1}] ✓ score={rev['score']}/10")
+                        accepted = True
+                    else:
+                        _log(f"  [{i+1}] ✗ score={rev['score']}/10 — retry with feedback")
+                except RuntimeError as e:
+                    _log(f"  [{i+1}] review error: {e} — accepting without review")
+                    review_info = {"reviewer": reviewer_id, "score": 0, "error": str(e)}
+                    accepted = True
+            else:
+                review_info = {"reviewer": None, "score": 0, "skipped": "no_review" if args.no_review else "no_reviewer"}
+                accepted = True
+
+        if not accepted:
+            _log(f"  [{i+1}] ✗ exhausted retries")
+
+        results.append({"subtask": desc, "agent": agent, "state": "completed" if accepted else "failed",
+                        "text": last_output, "review": review_info, "attempts": attempt})
+
+    # Step 3: Synthesize
+    completed = [r for r in results if r["state"] == "completed" and r["text"]]
+    failed = [r for r in results if r["state"] != "completed"]
+
+    _log(f"\n[3/4] Synthesizing {len(completed)} results...")
+
+    if len(completed) > 1 and not args.no_synth:
+        parts = "\n\n".join(
+            f"[子任务 {i+1}: {r['subtask'][:60]}]\n{r['text'][:3000]}"
+            for i, r in enumerate(completed)
+        )
+        synth_agent = alive[-1] if len(alive) > 1 else alive[0]
+        synth_prompt = (
+            f"请将以下 {len(completed)} 个子任务的输出整合为一个完整、连贯的最终答案。"
+            f"去除重复，保留关键信息，确保逻辑通顺。\n\n"
+            f"原始任务：{text}\n\n"
+            f"{parts}"
+        )
+        try:
+            synth_r = _a2a_send_blocking(name, synth_agent, synth_prompt)
+            final_text = synth_r.get("text", "")
+            _log(f"  synthesized by {synth_agent}")
+        except RuntimeError:
+            final_text = "\n\n".join(r["text"] for r in completed)
+            _log(f"  synthesis failed, concatenating raw outputs")
+    elif completed:
+        final_text = completed[0]["text"]
+    else:
+        final_text = "(all subtasks failed)"
+
+    # Step 4: Report
+    _log(f"\n[4/4] Report")
+
+    report = {
+        "team": name,
+        "task": text,
+        "subtask_count": len(subtasks),
+        "completed": len(completed),
+        "failed": len(failed),
+        "subtasks": [{
+            "desc": r["subtask"],
+            "agent": r["agent"],
+            "state": r["state"],
+            "review_score": r["review"].get("score", 0),
+            "reviewer": r["review"].get("reviewer"),
+            "attempts": r["attempts"],
+        } for r in results],
+    }
+
+    if args.json:
+        report["final_text"] = final_text
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(f"\n━━━ Brain Report ━━━")
+        print(f"Task: {text[:120]}")
+        print(f"Subtasks: {len(completed)} completed, {len(failed)} failed\n")
+        for i, r in enumerate(results):
+            review_score = r['review'].get('score', '?')
+            reviewer = r['review'].get('reviewer', 'none')
+            retry_mark = f"→✓" if r['attempts'] > 1 and r['state'] == 'completed' else ""
+            mark = "✓" if r['state'] == 'completed' else "✗"
+            if retry_mark:
+                mark = f"✗{retry_mark}"
+            print(f"  [{mark}] {r['subtask'][:70]} → {r['agent']} (reviewed by {reviewer}: {review_score}/10)")
+
+        print(f"\n━━━ Final Output ━━━")
+        print(final_text)
+
+        # Cost summary
+        cost_data = load_json(team_dir(name) / "cost-ledger.jsonl", None)
+        print(f"\n━━━ Session ━━━")
+        print(f"  Subtasks: {len(subtasks)} dispatched, {len(completed)} accepted, {len(failed)} failed")
+        total_attempts = sum(r["attempts"] for r in results)
+        print(f"  Requests: {total_attempts} dispatch + {sum(1 for r in results if r['review'].get('reviewer'))} reviews")
+
 # ────── argparse ──────
 def main():
     ap = argparse.ArgumentParser(prog="mmteam")
@@ -1629,6 +1923,37 @@ def main():
     x.set_defaults(fn=cmd_a2a_register)
     x = sp_a2a.add_parser("discover"); x.add_argument("url")
     x.set_defaults(fn=cmd_a2a_discover)
+    x = sp_a2a.add_parser("supervise", help="Brain loop: decompose → dispatch → cross-review → retry → synthesize")
+    x.add_argument("name"); x.add_argument("text")
+    x.add_argument("--max-retries", type=int, default=2, help="Max retries per subtask on review failure (default: 2)")
+    x.add_argument("--cost-ceiling", type=float, default=0.50, help="Pause if cumulative cost exceeds this USD amount (default: 0.50)")
+    x.add_argument("--no-review", action="store_true", help="Skip cross-review (faster, less quality)")
+    x.add_argument("--no-synth", action="store_true", help="Skip final synthesis (return raw subtask outputs)")
+    x.add_argument("--subtasks-file", default="", help="Read subtask list from file instead of auto-decompose (format: agent: description per line)")
+    x.add_argument("--json", action="store_true", help="Output structured JSON")
+    x.set_defaults(fn=cmd_a2a_supervise)
+
+    # ── KeyValueStore subcommands ──
+    p_kv = sp.add_parser("kv", help="Persistent key-value store commands")
+    sp_kv = p_kv.add_subparsers(dest="kv_cmd", required=True)
+
+    x = sp_kv.add_parser("set", help="Set a key-value pair")
+    x.add_argument("key", help="Key name")
+    x.add_argument("value", help="Value to store")
+    x.set_defaults(fn=lambda args: (kv_store.set(args.key, args.value), print(f"✅ Set '{args.key}' = '{args.value}'")))
+
+    x = sp_kv.add_parser("get", help="Get value by key")
+    x.add_argument("key", help="Key name")
+    x.add_argument("--default", default="", help="Default value if key not found")
+    x.set_defaults(fn=lambda args: print(kv_store.get(args.key, args.default)))
+
+    x = sp_kv.add_parser("del", help="Delete a key")
+    x.add_argument("key", help="Key name")
+    x.set_defaults(fn=lambda args: print("✅ Deleted" if kv_store.delete(args.key) else "⚠️  Key not found"))
+
+    x = sp_kv.add_parser("list", help="List all keys (optional prefix filter)")
+    x.add_argument("--prefix", default="", help="Filter keys by prefix")
+    x.set_defaults(fn=lambda args: [print(k) for k in kv_store.list(args.prefix)])
 
     args = ap.parse_args()
     args.fn(args)

@@ -83,6 +83,7 @@ const A2A_VERBS = new Set([
   "routes",
   "who",
   "cost",
+  "supervise",
 ]);
 
 // Top-level mmteam verbs that are NOT under `a2a`:
@@ -101,7 +102,11 @@ const TOPLEVEL = new Set([
 ]);
 
 let argv;
-if (subcommand === "a2a") {
+if (subcommand === "brain") {
+  // Brain mode: first step is checking team health; the orchestrator agent
+  // handles the multi-step workflow after this initial probe.
+  argv = ["a2a", "who", ...rest];
+} else if (subcommand === "a2a") {
   // Pass-through: slash command already specified `a2a <verb>`
   argv = ["a2a", ...rest];
 } else if (A2A_VERBS.has(subcommand)) {
