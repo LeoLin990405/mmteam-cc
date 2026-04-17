@@ -1,0 +1,66 @@
+name: Smoke Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install (dry-run)
+        run: bash install.sh --dry-run
+
+      - name: Validate marketplace.json
+        run: |
+          jq empty .claude-plugin/marketplace.json
+          PLUGIN_SRC=$(jq -r '.plugins[0].source' .claude-plugin/marketplace.json)
+          test -d "$PLUGIN_SRC" && echo "Plugin source dir exists: $PLUGIN_SRC"
+
+      - name: Validate plugin structure
+        run: |
+          test -d plugins/mmteam/commands
+          test -d plugins/mmteam/agents
+          test -d plugins/mmteam/skills/mmteam
+          test -d plugins/mmteam/scripts
+          CMDS=$(ls plugins/mmteam/commands/*.md | wc -l)
+          echo "Slash commands: $CMDS"
+          test "$CMDS" -ge 10
+
+      - name: Python compile check
+        run: |
+          for f in bin/*.py; do
+            python3 -m py_compile "$f"
+          done
+
+      - name: Node syntax check
+        run: |
+          for f in plugins/mmteam/scripts/*.mjs; do
+            node --check "$f"
+          done
+
+      - name: MCP register test
+        run: |
+          # Register with a fake script path
+          echo '#!/usr/bin/env python3' > /tmp/fake-mcp.py
+          node plugins/mmteam/scripts/register-mcp.mjs /tmp/fake-mcp.py || true
+          node plugins/mmteam/scripts/register-mcp.mjs --status
+          node plugins/mmteam/scripts/register-mcp.mjs --remove
+          rm /tmp/fake-mcp.py
