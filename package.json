@@ -26,6 +26,10 @@
     "install:tools": "bash install.sh",
     "uninstall:tools": "bash uninstall.sh",
     "doctor": "bash doctor.sh",
-    "sync:dev": "bash scripts/sync-from-dev.sh"
+    "test": "npm run lint:syntax",
+    "lint:syntax": "node -c plugins/mmteam/scripts/mmteam-bridge.mjs && node -c plugins/mmteam/scripts/register-mcp.mjs && PYTHONPYCACHEPREFIX=/tmp/mmteam-pycache python3 -m py_compile bin/mmteam bin/mmteam-mcp.py bin/mmteam-a2a-server.py bin/mmteam-a2a-monitor.py && bash -n install.sh uninstall.sh doctor.sh scripts/sync-from-dev.sh",
+    "check": "npm run lint:syntax && npm test && npm run test:smoke:syntax",
+    "sync:dev": "bash scripts/sync-from-dev.sh",
+    "test:smoke:syntax": "bash -n tests/smoke/test-a2a-send.sh && bash -n tests/smoke/test-create-spawn-stop.sh && bash -n tests/smoke/test-fanout-dry.sh && bash -n tests/smoke/test-mcp-register.sh"
   }
 }

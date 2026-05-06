@@ -241,19 +241,22 @@ They are **complementary**:
 
 Full diagnostics: `bash doctor.sh`
 
+Local project gate: `npm run check` runs JavaScript syntax checks, Python
+bytecode compilation, shell syntax checks, and smoke-script syntax checks.
+
 ---
 
 ## Files
 
 ```
 mmteam-cc/
-├── bin/                    # Vendored mmteam v2.18 scripts
-│   ├── mmteam              # Main CLI (1637 lines)
+├── bin/                    # Vendored mmteam scripts
+│   ├── mmteam              # Main CLI
 │   ├── mmteam-a2a-server.py # Per-teammate HTTP daemon
 │   ├── mmteam-a2a-monitor.py # Event stream viewer
 │   └── mmteam-mcp.py       # MCP stdio server (20 tools)
 ├── plugins/mmteam/         # Claude Code plugin
-│   ├── commands/           # 13 slash commands
+│   ├── commands/           # 15 slash commands
 │   ├── agents/             # mmteam-orchestrator
 │   ├── skills/mmteam/      # SKILL.md + ROUTING.md
 │   └── scripts/            # Bridge + MCP registrar
