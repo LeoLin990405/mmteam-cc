@@ -1,0 +1,11 @@
+# OS / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Runtime artifacts (bridges write to /tmp by default, but allow opt-in local writes)
+*.log
+/tmp/
+out/
+dist/

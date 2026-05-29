@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# agent-bridge — Unified dispatcher for 5 surface bridges.
+#
+# Single entry-point for Claude to drive any of the 5 surfaces:
+#   codex-cli / codex-app / antigravity / qoder-cli / trae-solo
+#
+# Usage:
+#   agent-bridge <surface> <verb> [args...]
+#   agent-bridge --list                    # show all surfaces + status snapshot
+#   agent-bridge --status                  # ping all bridges, print state matrix
+#
+# Examples:
+#   agent-bridge codex-cli status
+#   agent-bridge codex-app review /path/to/review.md
+#   agent-bridge antigravity review /path/to/review.md --timeout 600
+#   agent-bridge qoder-cli ask "explain X"
+#   agent-bridge --status                  # one-shot health check across all
+#
+# Each <surface>-bridge.sh maps:
+#   codex-cli   → ~/.claude/bin/codex-cli-bridge.sh
+#   codex-app   → ~/.claude/bin/codex-bridge.sh         (legacy name = the App driver)
+#   antigravity → ~/.claude/bin/antigravity-bridge.sh
+#   qoder-cli   → ~/.claude/bin/qoder-cli-bridge.sh
+#   trae-solo   → ~/.claude/bin/trae-solo-bridge.sh     (待写 — Phase 2)
+
+set -euo pipefail
+
+BIN_DIR="$HOME/.claude/bin"
+
+declare -A SURFACES=(
+  [codex-cli]="codex-cli-bridge.sh"
+  [codex-app]="codex-bridge.sh"
+  [antigravity]="antigravity-bridge.sh"
+  [qoder-cli]="qoder-cli-bridge.sh"
+  [trae-solo]="trae-solo-bridge.sh"
+)
+
+list_surfaces() {
+  echo "Available surfaces:"
+  for s in codex-cli codex-app antigravity qoder-cli trae-solo; do
+    local script="$BIN_DIR/${SURFACES[$s]}"
+    if [ -x "$script" ]; then
+      echo "  ✓ $s   → $script"
+    else
+      echo "  ✗ $s   → $script (not installed)"
+    fi
+  done
+}
+
+status_all() {
+  echo "Surface health matrix:"
+  printf "%-13s | %-9s | %s\n" "surface" "installed" "bridge-status"
+  printf "%-13s-+-%-9s-+-%s\n" "-------------" "---------" "------------------------"
+  for s in codex-cli codex-app antigravity qoder-cli trae-solo; do
+    local script="$BIN_DIR/${SURFACES[$s]}"
+    local installed="no"
+    local st="(skipped)"
+    if [ -x "$script" ]; then
+      installed="yes"
+      # Run status subcommand with timeout to avoid hangs
+      if st_raw=$(timeout 10 "$script" status 2>&1); then
+        # Compact first non-empty line
+        st=$(echo "$st_raw" | grep -vE '^\s*$' | head -1 | cut -c1-60)
+      else
+        st="status command failed"
+      fi
+    fi
+    printf "%-13s | %-9s | %s\n" "$s" "$installed" "$st"
+  done
+}
+
+dispatch() {
+  local surface="$1"
+  shift
+  if [ -z "${SURFACES[$surface]:-}" ]; then
+    echo "[agent-bridge] unknown surface: $surface" >&2
+    echo "Try one of: ${!SURFACES[*]}" >&2
+    exit 2
+  fi
+  local script="$BIN_DIR/${SURFACES[$surface]}"
+  if [ ! -x "$script" ]; then
+    echo "[agent-bridge] $surface bridge not installed: $script" >&2
+    echo "  → Either write the bridge or use a different surface." >&2
+    exit 1
+  fi
+  exec "$script" "$@"
+}
+
+case "${1:-}" in
+  --list|-l)    list_surfaces ;;
+  --status|-s)  status_all ;;
+  ""|-h|--help)
+    sed -n '2,/^$/p' "$0" | sed 's/^# //'
+    exit 0
+    ;;
+  *)
+    dispatch "$@"
+    ;;
+esac
