@@ -2,35 +2,23 @@
 # grok-bridge.sh — Drive Grok web (grok.com) via the user's main Chrome
 # using opencli's official Browser Bridge (extension + daemon, port 19825).
 #
-# REVISION 2026-05-31: rewritten from dedicated-Chrome model to use the
-# user's primary Chrome (their logged-in Google account). No more port-9237
-# spawned instance. Requires the opencli Chrome extension to be loaded:
-#   1. Open chrome://extensions/, enable Developer mode
-#   2. "Load unpacked" → /Users/leo/Projects/OpenCLI/extension
-#   3. Verify: `opencli doctor` → [OK] Extension: connected
+# REVISION 2026-05-31 (v2): rewritten after finding the real selectors.
 #
-# ⚠ KNOWN LIMITATION (verified 2026-05-31 on Grok free tier):
-#   Grok's free tier blocks programmatic input submission at React state
-#   level. The "SuperGrok upgrade" overlay is more than a DOM modal — it
-#   disables the input form's submit handler even after the modal node
-#   is nuked from DOM. Symptoms:
-#     · attach/model/dictate buttons report disabled=true
-#     · Enter / contextual-button-click both no-op (no POST fires)
-#     · plain modal nuking doesn't lift the React paywall
-#   Workaround: requires SuperGrok subscription, OR send via another
-#   surface (Claude/ChatGPT/Gemini web with same main-Chrome architecture).
-#   Status / list / bind / login flow all work — only ASK is blocked.
+# What we learned (the hard way):
+#   1. The visible "今天需要我如何帮助你？" / "Ask me anything..." placeholder is
+#      NOT on a <textarea> — Grok uses Tiptap (ProseMirror) on a
+#      <div contenteditable="true" role="textbox" aria-label="Ask Grok anything">.
+#   2. opencli's `fill` / `type` won't work on Tiptap. Use:
+#         document.execCommand('insertText', false, prompt)
+#      to dispatch a beforeinput event that ProseMirror listens to.
+#   3. The send button is NOT in the form until you fill content. Once the
+#      div has text, the voice-mode mic morphs into <button data-testid="chat-submit">
+#      with visible label "提交" (Submit).
+#   4. The Aitopia browser extension Leo has installed renders its own
+#      <textarea placeholder="Ask me anything..."> in a sidebar — easy to
+#      mistake for Grok's input. Always select by aria-label="Ask Grok anything".
 #
-# Session name "grok" is the opencli browser-session alias bound to a
-# specific Chrome tab. Bind happens lazily on first `ask` call.
-#
-# Usage:
-#   grok-bridge.sh status                          # opencli doctor + ping daemon
-#   grok-bridge.sh list                            # state of bound tab (interactive refs)
-#   grok-bridge.sh modes                           # Grok model picker (informational)
-#   grok-bridge.sh ask    <prompt>     [--timeout S] [--idle SEC]
-#   grok-bridge.sh review <prompt-file> [--timeout S]
-#   grok-bridge.sh bind                            # explicit bind active tab to "grok"
+# Verified 2026-05-31: ask sends, URL transitions /  → /c/<uuid>?rid=<uuid>.
 
 set -euo pipefail
 
@@ -45,14 +33,9 @@ IDLE_SEC=4
 OUT_DIR="/tmp/grok-bridge"
 mkdir -p "$OUT_DIR"
 
-INPUT_SEL='textarea[placeholder="Ask me anything..."]'
-# Fallback selectors tried in order if INPUT_SEL misses.
-INPUT_FALLBACKS=(
-  'textarea[aria-label="Ask Grok anything"]'
-  'textarea[placeholder="What do you want to know?"]'
-  'textarea[placeholder*="Ask"]'
-  'textarea[placeholder*="message"]'
-)
+# Real Grok selectors (verified 2026-05-31)
+INPUT_SEL='[contenteditable="true"][aria-label="Ask Grok anything"]'
+SUBMIT_SEL='button[data-testid="chat-submit"]'
 
 die() { echo "[grok-bridge] $*" >&2; exit "${2:-1}"; }
 
@@ -91,11 +74,19 @@ cmd_status() {
   echo
   echo "=== Grok session state ==="
   local probe
-  probe=$(opencli browser "$SESSION" eval "(() => ({url: location.href, title: document.title, logged_in_signal: !document.querySelector('button:has-text(\"登录\")') && !!document.querySelector('textarea')}))()" 2>/dev/null | tail -10)
+  probe=$(opencli browser "$SESSION" eval "(() => {
+    const input = document.querySelector('$INPUT_SEL');
+    return {
+      url: location.href,
+      title: document.title,
+      input_ready: !!input,
+      logged_in: !location.href.includes('accounts.google'),
+    };
+  })()" 2>/dev/null | tail -10)
   if [ -n "$probe" ]; then
     echo "$probe"
   else
-    echo "  ✗ session '$SESSION' not bound yet — run 'grok-bridge.sh bind' (with grok.com tab active)"
+    echo "  ✗ session '$SESSION' not bound — open grok.com in main Chrome then run 'grok-bridge.sh bind'"
   fi
 }
 
@@ -103,9 +94,6 @@ cmd_bind() {
   check_extension
   echo "[grok-bridge] binding active Chrome tab to session '$SESSION'..." >&2
   opencli browser "$SESSION" bind 2>&1 | head -5
-  echo
-  echo "Verify with:"
-  echo "  opencli browser $SESSION state"
 }
 
 cmd_modes() {
@@ -114,31 +102,31 @@ import json
 print(json.dumps({
     "surface": "grok",
     "axis": "model",
-    "active_mode": "(set in Grok UI model picker)",
-    "available_modes": ["grok-2", "grok-3", "grok-3-think", "grok-4", "grok-4-heavy"],
-    "note": "Grok's model is chosen via the in-page picker; not programmatic."
+    "active_mode": "(set in Grok UI via 'Fast'/'Expert' picker)",
+    "available_modes": ["grok-3", "grok-3-think", "grok-4", "grok-4-heavy"],
+    "note": "Free tier defaults to grok-3 'Fast'. Programmatic switch via the model-select-trigger button (ref via list)."
 }, indent=2))
 PYEOF
 }
 
 cmd_list() {
   check_extension
-  # Use eval — 'state' default format isn't pure JSON.
   local raw
   raw=$(opencli browser "$SESSION" eval "(() => {
-    const all_ta = document.querySelectorAll('textarea');
     return {
       url: location.href,
       title: document.title,
-      total_textareas: all_ta.length,
-      logged_in_signal: location.href.includes('grok.com') && !document.body.innerText.includes('登录') && !document.body.innerText.includes('Sign in'),
-      conv_links: Array.from(document.querySelectorAll('a[href*=\"/chat/\"], a[href*=\"/c/\"]')).slice(0, 10).map(a => ({href: a.getAttribute('href'), text: (a.textContent||'').trim().slice(0, 50)})),
+      logged_in: !location.href.includes('accounts.google') && location.href.includes('grok.com'),
+      input_ready: !!document.querySelector('$INPUT_SEL'),
+      conv_links: Array.from(document.querySelectorAll('a[href*=\"/c/\"]')).slice(0, 10).map(a => ({
+        href: a.getAttribute('href'),
+        text: (a.textContent||'').trim().slice(0, 50)
+      })),
     };
   })()" 2>/dev/null)
   python3 -c "
 import json, re, sys
 raw = '''$raw'''
-# opencli eval output may be a JSON-like literal at the end; extract last {...} block
 m = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw, re.DOTALL)
 try:
     inner = json.loads(m.group(0)) if m else {}
@@ -150,16 +138,16 @@ print(json.dumps({
     'active_session': 'current',
     'page_url': inner.get('url', ''),
     'page_title': inner.get('title', ''),
-    'logged_in': bool(inner.get('logged_in_signal')),
-    'total_textareas': inner.get('total_textareas', 0),
-    'conv_links': inner.get('conv_links', []),
-    'sessions': [{'id': 'current', 'title': inner.get('title', '(grok page)')[:60]}],
+    'logged_in': bool(inner.get('logged_in')),
+    'input_ready': bool(inner.get('input_ready')),
+    'conv_links_count': len(inner.get('conv_links', [])),
+    'recent_conversations': inner.get('conv_links', [])[:5],
+    'sessions': [{'id': c.get('href'), 'title': c.get('text')} for c in inner.get('conv_links', [])[:10]] or [{'id': 'current', 'title': inner.get('title','grok')[:60]}],
     'note': 'main Chrome via opencli extension'
 }, indent=2, ensure_ascii=False))
 "
 }
 
-# Ensure the bound tab is at grok.com (open if not).
 _ensure_grok_page() {
   local cur_url
   cur_url=$(opencli browser "$SESSION" eval "location.href" 2>/dev/null | tail -3 | grep -oE 'https?://[^"]+' | head -1)
@@ -179,47 +167,71 @@ cmd_ask() {
   ts=$(date +%Y%m%d-%H%M%S)
   response_file="$OUT_DIR/ask-$ts.md"
 
-  # 1. Make sure we're on grok.com
   _ensure_grok_page
 
-  # 2. Wait for the chat input to appear
-  echo "[grok-bridge] waiting for chat input..." >&2
+  # 1. Wait for the Tiptap input to be present
+  echo "[grok-bridge] waiting for Tiptap chat input..." >&2
   opencli browser "$SESSION" wait selector "$INPUT_SEL" --timeout 15 >/dev/null 2>&1 || \
-    die "chat input never appeared. Are you logged in?" 1
+    die "Grok chat input not found. Are you logged in?" 1
 
-  # 3. Capture baseline state to detect new assistant reply later.
-  local baseline
-  baseline=$(opencli browser "$SESSION" extract -f md 2>/dev/null | wc -c | xargs)
-
-  # 4. Fill input
+  # 2. Fill via execCommand insertText (Tiptap/ProseMirror compatible).
+  #    JSON-escape the prompt so it can ride inside the eval string.
+  local prompt_json
+  prompt_json=$(python3 -c "import sys, json; print(json.dumps(sys.argv[1]))" "$prompt")
   echo "[grok-bridge] filling prompt (${#prompt} chars)..." >&2
-  opencli browser "$SESSION" fill "$INPUT_SEL" "$prompt" 2>&1 | tail -3
-
-  # 5. Click send — Grok's send button is the LAST button in the form.
-  #    Use JS eval since the button has no aria-label / type=submit.
-  echo "[grok-bridge] clicking send..." >&2
   opencli browser "$SESSION" eval "(() => {
-    const ta = document.querySelector('$INPUT_SEL');
-    const form = ta?.closest('form') || ta?.parentElement?.parentElement;
-    const btns = form ? Array.from(form.querySelectorAll('button')).filter(b => !b.disabled) : [];
-    const target = btns[btns.length - 1];
-    if (!target) return {ok: false, why: 'no send button'};
-    target.click();
-    return {ok: true, btn_cls: (target.className||'').slice(0,60)};
-  })()" 2>&1 | tail -5
+    const input = document.querySelector('$INPUT_SEL');
+    if (!input) return {ok:false, why:'no input'};
+    input.focus();
+    // Clear existing content
+    const range = document.createRange();
+    range.selectNodeContents(input);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    document.execCommand('delete');
+    // Insert text — fires beforeinput → ProseMirror updates state
+    document.execCommand('insertText', false, ${prompt_json});
+    return {ok:true, text_now: input.innerText.slice(0, 60)};
+  })()" 2>&1 | grep -E '"ok"|"text_now"' | head -2
 
-  # 6. Poll for response stable (idle detection).
+  sleep 1
+
+  # 3. Wait for the submit button to appear (it only renders after input has content).
+  echo "[grok-bridge] waiting for submit button..." >&2
+  opencli browser "$SESSION" wait selector "$SUBMIT_SEL" --timeout 10 >/dev/null 2>&1 || \
+    die "submit button never appeared. Input may not have registered text properly." 1
+
+  # 4. Click submit
+  echo "[grok-bridge] clicking 提交..." >&2
+  opencli browser "$SESSION" click "$SUBMIT_SEL" 2>&1 | tail -2
+
+  # 5. Wait for URL to transition to /c/<uuid> — that's the send-completed signal.
+  echo "[grok-bridge] waiting for /c/ navigation (send-completed signal)..." >&2
+  local sent=0
+  for i in $(seq 1 30); do
+    sleep 1
+    local url
+    url=$(opencli browser "$SESSION" eval "location.href" 2>/dev/null | tail -3 | grep -oE 'https?://[^"]+' | head -1)
+    if [[ "$url" == *"/c/"* ]]; then
+      sent=1
+      echo "[grok-bridge]   ✓ sent — now on $url" >&2
+      break
+    fi
+  done
+  [ "$sent" = "0" ] && die "send button clicked but URL didn't transition to /c/<uuid>" 1
+
+  # 6. Poll for response stable (idle detection by text length).
   echo "[grok-bridge] waiting for response (timeout ${TIMEOUT_SEC}s, idle ${IDLE_SEC}s)..." >&2
   local deadline=$((SECONDS + TIMEOUT_SEC))
   local last_size=0 last_change=$SECONDS first_seen=0
   while [ $SECONDS -lt $deadline ]; do
     sleep 1
     local cur
-    cur=$(opencli browser "$SESSION" extract -f md 2>/dev/null > "$OUT_DIR/poll-$ts.md" && wc -c < "$OUT_DIR/poll-$ts.md" | xargs)
+    cur=$(opencli browser "$SESSION" extract --chunk-size 50000 2>/dev/null > "$OUT_DIR/poll-$ts.md" && wc -c < "$OUT_DIR/poll-$ts.md" | xargs)
     cur=${cur:-0}
-    if [ "$cur" -gt "$baseline" ] && [ "$first_seen" = "0" ]; then
+    if [ "$cur" -gt "$last_size" ] && [ "$first_seen" = "0" ]; then
       first_seen=1
-      echo "[grok-bridge]   response started ($cur chars)..." >&2
     fi
     if [ "$cur" != "$last_size" ]; then
       last_size=$cur
@@ -229,8 +241,8 @@ cmd_ask() {
     fi
   done
 
-  # 7. Final extract = response file.
-  opencli browser "$SESSION" extract -f md > "$response_file" 2>/dev/null || \
+  # 7. Final extract
+  opencli browser "$SESSION" extract --chunk-size 50000 > "$response_file" 2>/dev/null || \
     die "final extract failed" 1
 
   echo "RESPONSE_FILE=$response_file"
@@ -265,7 +277,6 @@ cmd_delete() {
   if [ "$DELETE_DRY_RUN" = "1" ]; then return 0; fi
   echo "[grok:delete] NOT IMPLEMENTED — selector for trash icon unknown." >&2
   echo "  Workaround: hover conversation in sidebar → trash icon." >&2
-  echo "  Use discover-delete-selector.sh while hovering to find the selector." >&2
   exit 1
 }
 
