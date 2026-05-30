@@ -7,8 +7,11 @@
 
 set -euo pipefail
 
-SRC_DIR="$(cd "$(dirname "$0")" && pwd)/bin"
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC_DIR="$REPO_DIR/bin"
+SKILL_SRC_DIR="$REPO_DIR/skills/agent-bridge"
 DEST_DIR="${HOME}/.claude/bin"
+SKILL_DEST_DIR="${HOME}/.claude/skills/agent-bridge"
 MODE="link"
 
 while [ $# -gt 0 ]; do
@@ -54,9 +57,27 @@ done
 
 echo
 echo "[install] installed $count scripts into $DEST_DIR"
+
+# Install the agent-bridge Claude Code skill (so /skill agent-bridge works).
+if [ -d "$SKILL_SRC_DIR" ]; then
+  echo
+  echo "[install] installing skill: agent-bridge → $SKILL_DEST_DIR"
+  mkdir -p "$(dirname "$SKILL_DEST_DIR")"
+  if [ "$MODE" = "link" ]; then
+    ln -sfn "$SKILL_SRC_DIR" "$SKILL_DEST_DIR"
+    echo "  link  $SKILL_DEST_DIR → $SKILL_SRC_DIR"
+  else
+    mkdir -p "$SKILL_DEST_DIR/references"
+    cp -f "$SKILL_SRC_DIR/SKILL.md" "$SKILL_DEST_DIR/"
+    cp -f "$SKILL_SRC_DIR/references/"*.md "$SKILL_DEST_DIR/references/" 2>/dev/null || true
+    echo "  copy  $SKILL_DEST_DIR (SKILL.md + references/)"
+  fi
+fi
+
 echo
 echo "Verify:"
 echo "  $DEST_DIR/agent-bridge --status"
+echo "  # in Claude Code, the 'agent-bridge' skill should appear in /skill"
 echo
 echo "If ~/.claude/bin is not in PATH yet, add to ~/.zshrc or ~/.bashrc:"
 echo "  export PATH=\"\$HOME/.claude/bin:\$PATH\""
