@@ -9,6 +9,9 @@
 #   agent-bridge --list                    # show all surfaces + status snapshot
 #   agent-bridge --status                  # ping all bridges, print state matrix
 #   agent-bridge inbox <list|read|clear>   # reverse-callback inbox (Layer 4)
+#   agent-bridge count                     # session counts across all surfaces
+#   agent-bridge inventory                 # opencli adapter inventory + diff
+#   agent-bridge update [--check|--auto|--use-fork]   # update opencli pkg + sync fork
 #
 # Examples:
 #   agent-bridge codex-cli status
@@ -129,6 +132,17 @@ case "${1:-}" in
       exit 1
     fi
     exec "$BIN_DIR/_inbox.py" "$@"
+    ;;
+  inventory|--inventory)
+    # opencli adapter inventory — installed vs fork vs upstream
+    shift
+    exec "$BIN_DIR/opencli-inventory.sh" "$@"
+    ;;
+  update-opencli|update)
+    # Update the opencli npm pkg + sync fork main with upstream.
+    # Pass --check for dry-run, --auto for unattended, --use-fork for fork-built override.
+    shift
+    exec "$BIN_DIR/opencli-self-update.sh" "$@"
     ;;
   count|--count)
     # Run 'list' on every surface, count sessions, print summary table.
