@@ -48,25 +48,53 @@ list_surfaces() {
 }
 
 status_all() {
-  echo "Surface health matrix:"
-  printf "%-13s | %-9s | %s\n" "surface" "installed" "bridge-status"
-  printf "%-13s-+-%-9s-+-%s\n" "-------------" "---------" "------------------------"
+  # Compact one-line health (parses ✓/✗ from each bridge's own status output)
+  echo "═══ Surface health summary ═══"
+  printf "%-13s | %-12s | %s\n" "surface" "installed" "ready signal"
+  printf "%-13s-+-%-12s-+-%s\n" "-------------" "------------" "------------------------"
   for s in codex-cli codex-app antigravity qoder-cli trae-solo; do
     local script="$BIN_DIR/${SURFACES[$s]}"
     local installed="no"
-    local st="(skipped)"
+    local ready="(skipped)"
     if [ -x "$script" ]; then
       installed="yes"
-      # Run status subcommand with timeout to avoid hangs
       if st_raw=$(timeout 10 "$script" status 2>&1); then
-        # Compact first non-empty line
-        st=$(echo "$st_raw" | grep -vE '^\s*$' | head -1 | cut -c1-60)
+        # Extract ✓/✗ summary lines, fall back to grepping "Connected" / "version"
+        local good bad
+        good=$(echo "$st_raw" | grep -cE '✓' || true)
+        bad=$(echo "$st_raw" | grep -cE '✗' || true)
+        if [ "$bad" -gt 0 ]; then
+          ready="✗ down ($bad failing)"
+        elif [ "$good" -gt 0 ]; then
+          ready="✓ ready ($good check)"
+        elif echo "$st_raw" | grep -qiE "Connected|version:"; then
+          ready="✓ ready"
+        elif echo "$st_raw" | grep -qiE "ok: false|error|failed"; then
+          ready="✗ down"
+        else
+          ready="?"
+        fi
       else
-        st="status command failed"
+        ready="✗ status timeout"
       fi
     fi
-    printf "%-13s | %-9s | %s\n" "$s" "$installed" "$st"
+    printf "%-13s | %-12s | %s\n" "$s" "$installed" "$ready"
   done
+
+  # Detail per surface (multi-line, only shown if --verbose / -v)
+  if [ "${1:-}" = "-v" ] || [ "${1:-}" = "--verbose" ]; then
+    echo
+    for s in codex-cli codex-app antigravity qoder-cli trae-solo; do
+      local script="$BIN_DIR/${SURFACES[$s]}"
+      echo "═══ $s ═══"
+      if [ -x "$script" ]; then
+        timeout 10 "$script" status 2>&1 | grep -vE '^\s*$|UNDICI-EHPA' | head -10 | sed 's/^/  /'
+      else
+        echo "  (not installed: $script)"
+      fi
+      echo
+    done
+  fi
 }
 
 dispatch() {

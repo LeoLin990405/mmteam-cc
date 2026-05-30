@@ -68,7 +68,20 @@ extract_issues_count() {
 
 # -------- subcommands --------
 cmd_status() {
-  opencli codex status 2>&1
+  # Direct CDP ping (does NOT trigger opencli's slow probe-and-restart logic).
+  local port=9238
+  echo "=== Codex Desktop App CDP (port $port) ==="
+  if curl -s --max-time 2 "http://localhost:$port/json/version" | grep -q "Browser" 2>/dev/null; then
+    echo "✓ CDP up"
+    curl -s "http://localhost:$port/json/version" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(f'  Browser: {d.get(\"Browser\",\"?\")}')
+print(f'  UA: {d.get(\"User-Agent\",\"?\")[:80]}')
+" 2>/dev/null
+  else
+    echo "✗ CDP not up on :$port — run ~/.claude/bin/codex-launch-with-cdp.sh"
+  fi
 }
 
 cmd_ask() {
