@@ -92,6 +92,57 @@ Note: Qoder's separate `qodercli` AI terminal is **already adequate** (we wrap i
 
 ---
 
+## Issue draft #3 (NEW, high-priority bug — found while testing v1.8.0) — "`opencli antigravity serve` fails with ERR_MODULE_NOT_FOUND"
+
+**Title**: `[bug] opencli antigravity serve broken: dynamic import path off by one ..`
+
+**Labels**: `bug`, `antigravity`, `regression-candidate`
+
+**Body**:
+
+```markdown
+## Repro
+
+```bash
+$ opencli antigravity serve --port 8082
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module
+  '/Users/leo/.npm-global/lib/node_modules/@jackwener/opencli/dist/clis/antigravity/serve.js'
+```
+
+opencli v1.8.0, macOS 26.4.0, node v26.0.0.
+
+## Root cause
+
+`dist/src/cli.js` line 3056:
+```js
+const { startServe } = await import('../clis/antigravity/serve.js');
+```
+
+`cli.js` lives at `dist/src/cli.js`. Relative `'../clis/antigravity/serve.js'` resolves to `dist/clis/antigravity/serve.js`, but the bundled source is at `<package_root>/clis/antigravity/serve.js` (one level up, not under `dist/`).
+
+## One-line fix
+
+```diff
+-        const { startServe } = await import('../clis/antigravity/serve.js');
++        const { startServe } = await import('../../clis/antigravity/serve.js');
+```
+
+## Local workaround (until patched)
+
+```bash
+sed -i "" "s|'../clis/antigravity/serve.js'|'../../clis/antigravity/serve.js'|g" \
+  $(npm root -g)/@jackwener/opencli/dist/src/cli.js
+```
+
+Verified: after patch, `opencli antigravity serve --port 8082` listens correctly (`curl -X OPTIONS http://localhost:8082/v1/messages` returns HTTP 204).
+
+## PR
+
+Ready as a 1-line fix PR if maintainer agrees with diff. Will also check whether other `clis/<site>/<command>.js` dynamic imports in cli.js have the same bug (a quick `grep -n "clis/.*serve\|clis/.*\.js'" dist/src/cli.js` to audit).
+```
+
+---
+
 ## Issue draft #2 — "Antigravity CDP port should be configurable"
 
 **Title**: `[bug] Antigravity CDP port hardcoded to 9234, breaks when user starts Antigravity on 9333`
