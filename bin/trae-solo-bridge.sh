@@ -22,6 +22,8 @@
 
 set -euo pipefail
 
+source "$HOME/.claude/bin/_bridge_route.sh"
+
 # ─── ARCHITECTURE NOTE ────────────────────────────────────────────────
 # Selectors are kept in the Python helper (~/.claude/bin/_trae-solo-cdp.py)
 # because TRAE SOLO uses Lexical editor (Facebook framework) which needs
@@ -160,6 +162,9 @@ parse_opts() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --port)    PORT="$2"; shift 2 ;;
+      --project)   ROUTE_PROJECT="$2";  shift 2 ;;
+      --thread)    ROUTE_THREAD="$2";   shift 2 ;;
+      --mode)      ROUTE_MODE="$2";     shift 2 ;;
       --timeout) TIMEOUT_SEC="$2"; shift 2 ;;
       *)         REST+=("$1"); shift ;;
     esac
@@ -170,8 +175,28 @@ case "$CMD" in
   status) cmd_status ;;
   list)   exec "$PYTHON" "$CDP_HELPER" list --port "$PORT" ;;
   modes)  exec "$PYTHON" "$CDP_HELPER" modes --port "$PORT" ;;
-  ask)    shift; parse_opts "$@"; cmd_ask "${REST[@]:-}" ;;
-  review) shift; parse_opts "$@"; cmd_review "${REST[@]:-}" ;;
+  ask)
+
+    shift; parse_opts "$@"
+
+    cmd_ask "$(inject_routing_context "${REST[0]:-}")"
+
+    ;;
+  review)
+
+    shift; parse_opts "$@"
+
+    load_frontmatter_route "${REST[0]:-}"
+
+    _processed_prompt="/tmp/agent-bridge-prompt-$$.md"
+
+    inject_routing_context "$(strip_frontmatter "${REST[0]:-}")" > "$_processed_prompt"
+
+    cmd_review "$_processed_prompt"
+
+    rm -f "$_processed_prompt"
+
+    ;;
   ""|-h|--help)
     sed -n '2,/^$/p' "$0" | sed 's/^# //'
     exit 0

@@ -29,6 +29,8 @@
 
 set -euo pipefail
 
+source "$HOME/.claude/bin/_bridge_route.sh"
+
 CMD="${1:-}"
 TIMEOUT_SEC=600
 OUT_DIR="/tmp/codex-bridge"
@@ -196,6 +198,9 @@ parse_opts() {
   out=()
   while [ $# -gt 0 ]; do
     case "$1" in
+      --project)   ROUTE_PROJECT="$2";  shift 2 ;;
+      --thread)    ROUTE_THREAD="$2";   shift 2 ;;
+      --mode)      ROUTE_MODE="$2";     shift 2 ;;
       --timeout) TIMEOUT_SEC="$2"; shift 2 ;;
       --out)     OUT_DIR="$2"; mkdir -p "$OUT_DIR"; shift 2 ;;
       *)         out+=("$1"); shift ;;
@@ -217,12 +222,16 @@ case "$CMD" in
   ask)
     shift
     parse_opts "$@"
-    cmd_ask "${REST[@]}"
+    cmd_ask "$(inject_routing_context "${REST[0]:-}")"
     ;;
   review)
     shift
     parse_opts "$@"
-    cmd_review "${REST[@]}"
+    load_frontmatter_route "${REST[0]:-}"
+    _processed_prompt="/tmp/agent-bridge-prompt-$$.md"
+    inject_routing_context "$(strip_frontmatter "${REST[0]:-}")" > "$_processed_prompt"
+    cmd_review "$_processed_prompt"
+    rm -f "$_processed_prompt"
     ;;
   ""|-h|--help)
     sed -n '2,/^$/p' "$0" | sed 's/^# //'
