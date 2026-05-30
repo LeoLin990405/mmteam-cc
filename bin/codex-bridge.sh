@@ -67,6 +67,59 @@ extract_issues_count() {
 }
 
 # -------- subcommands --------
+cmd_list() {
+  # Output unified JSON: {surface, active_session, sessions[{id,title,project,updated}]}
+  local hist_json
+  hist_json=$(mktemp)
+  opencli codex history -f json > "$hist_json" 2>/dev/null || {
+    echo "{\"surface\":\"codex-app\",\"error\":\"opencli codex history failed\"}"
+    rm -f "$hist_json"
+    return 1
+  }
+  HIST_FILE="$hist_json" python3 <<'PYEOF'
+import json, os, sys
+path = os.environ.get("HIST_FILE")
+try:
+    threads = json.load(open(path))
+except Exception as e:
+    print(json.dumps({"surface":"codex-app","error":f"parse fail: {e}"}))
+    sys.exit(1)
+
+out = {
+    "surface": "codex-app",
+    "active_session": next((t.get("ThreadId") for t in threads if t.get("Active")), None),
+    "sessions": [
+        {
+            "id": t.get("ThreadId"),
+            "title": (t.get("Title") or "")[:80],
+            "project": t.get("ProjectPath") or t.get("Project"),
+            "updated": t.get("Updated"),
+            "active": bool(t.get("Active"))
+        }
+        for t in threads
+    ]
+}
+print(json.dumps(out, indent=2, ensure_ascii=False))
+PYEOF
+  rm -f "$hist_json"
+}
+
+cmd_modes() {
+  # Codex App's "mode" axis is its active model (GPT-5 / GPT-5-codex / etc.)
+  local active_model
+  active_model=$(opencli codex model 2>&1 | grep -iE "current|active|model:" | head -1 | sed 's/.*: //' | xargs)
+  python3 <<PYEOF
+import json
+print(json.dumps({
+    "surface": "codex-app",
+    "axis": "model",
+    "active_mode": "$active_model" or None,
+    "available_modes": [],
+    "note": "Codex App models are switched via the app UI; opencli codex model reads current. Full list TBD."
+}, indent=2))
+PYEOF
+}
+
 cmd_status() {
   # Direct CDP ping (does NOT trigger opencli's slow probe-and-restart logic).
   local port=9238
@@ -152,6 +205,12 @@ parse_opts() {
 }
 
 case "$CMD" in
+  list)
+    cmd_list
+    ;;
+  modes)
+    cmd_modes
+    ;;
   status)
     cmd_status
     ;;

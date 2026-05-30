@@ -57,6 +57,44 @@ extract_issues_count() {
   ' "$1" 2>/dev/null
 }
 
+cmd_list() {
+  CODEX_SESS_DIR="$HOME/.codex/sessions" python3 <<'PYEOF'
+import json, os
+d = os.environ.get("CODEX_SESS_DIR", "")
+sessions = []
+if os.path.isdir(d):
+    try:
+        names = sorted(
+            os.listdir(d),
+            key=lambda f: os.path.getmtime(os.path.join(d, f)),
+            reverse=True
+        )[:10]
+        sessions = [{"id": n, "on_disk": True} for n in names]
+    except Exception:
+        pass
+print(json.dumps({
+    "surface": "codex-cli",
+    "stateless": True,
+    "active_session": None,
+    "sessions": sessions,
+    "note": "codex CLI is stateless per-invocation. --continue / --resume flags can attach to a prior session by id; otherwise each ask starts fresh."
+}, indent=2))
+PYEOF
+}
+
+cmd_modes() {
+  CODEX_SANDBOX="$SANDBOX_MODE" python3 <<'PYEOF'
+import json, os
+print(json.dumps({
+    "surface": "codex-cli",
+    "axis": "sandbox",
+    "active_mode": os.environ.get("CODEX_SANDBOX"),
+    "available_modes": ["read-only", "workspace-write", "danger-full-access"],
+    "note": "Codex CLI's mode axis is its sandbox permission level, not a chat mode."
+}, indent=2))
+PYEOF
+}
+
 cmd_status() {
   require_codex_cli
   echo "codex CLI: $(command -v codex)"
@@ -123,6 +161,8 @@ parse_opts() {
 }
 
 case "$CMD" in
+  list)   cmd_list ;;
+  modes)  cmd_modes ;;
   status) cmd_status ;;
   ask)    shift; parse_opts "$@"; cmd_ask "${REST[@]:-}" ;;
   review) shift; parse_opts "$@"; cmd_review "${REST[@]:-}" ;;

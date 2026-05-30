@@ -59,6 +59,83 @@ class CDPSession:
                 return r.get("result", {}).get("result", {}).get("value")
 
 
+def cmd_list(port):
+    """Output JSON inventory: active_session + project/session list."""
+    try:
+        ws = connect(port)
+    except Exception as e:
+        print(json.dumps({"surface": "trae-solo", "error": f"CDP unreachable: {e}"}))
+        return 1
+    s = CDPSession(ws)
+    raw = s.evaluate("""
+JSON.stringify({
+  active_session: (document.querySelector('[data-session-id]')||{}).getAttribute?.('data-session-id') || null,
+  sessions: Array.from(document.querySelectorAll('[data-session-id]')).map(e => ({
+    id: e.getAttribute('data-session-id'),
+    cls: (e.className||'').toString().slice(0,40),
+    preview: (e.innerText||'').trim().slice(0,80).replace(/\\s+/g, ' ')
+  })),
+  projects: Array.from(document.querySelectorAll('.task-list-group')).map(e => ({
+    name: (e.querySelector('[class*="name"], [class*="title"]')||e).innerText.split(/\\n/)[0].slice(0,60),
+    preview: (e.innerText||'').trim().slice(0,80).replace(/\\s+/g, ' ')
+  }))
+})
+""")
+    ws.close()
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception:
+        parsed = {}
+    out = {
+        "surface": "trae-solo",
+        "active_session": parsed.get("active_session"),
+        "sessions": parsed.get("sessions", []),
+        "projects": parsed.get("projects", [])
+    }
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_modes(port):
+    """Output JSON: detected mode tabs + active mode."""
+    try:
+        ws = connect(port)
+    except Exception as e:
+        print(json.dumps({"surface": "trae-solo", "error": f"CDP unreachable: {e}"}))
+        return 1
+    s = CDPSession(ws)
+    raw = s.evaluate("""
+JSON.stringify({
+  mode_tabs: Array.from(document.querySelectorAll(
+    '[class*="mode-switch"] > *, [class*="ModeSwitch"] > *, [class*="mode-tab"], [class*="tab-bar"] [role="tab"], [class*="solo-tab"], [class*="agent-mode"]'
+  )).slice(0, 10).map(e => ({
+    text: (e.innerText||e.textContent||'').trim().slice(0,40),
+    cls: (e.className||'').toString().slice(0,50),
+    aria_selected: e.getAttribute('aria-selected'),
+    active: (e.className||'').includes('active') || (e.className||'').includes('selected') || e.getAttribute('aria-selected') === 'true'
+  })),
+  builder_buttons: Array.from(document.querySelectorAll('button, [role="button"]')).filter(e => {
+    const t = ((e.textContent||'')+(e.getAttribute('aria-label')||'')).toLowerCase();
+    return /builder|solo|chat[\\s_-]?mode|ide[\\s_-]?mode|agent|composer/.test(t);
+  }).slice(0,8).map(e => ({
+    text: (e.innerText||'').trim().slice(0,30),
+    cls: (e.className||'').toString().slice(0,50)
+  }))
+})
+""")
+    ws.close()
+    parsed = json.loads(raw) if raw else {}
+    out = {
+        "surface": "trae-solo",
+        "axis": "ide-vs-chat",
+        "mode_tabs": parsed.get("mode_tabs", []),
+        "builder_buttons": parsed.get("builder_buttons", []),
+        "note": "Trae SOLO mode is inferred from UI tabs/buttons; manual UI interaction may be needed for switching."
+    }
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_status(port):
     try:
         ws = connect(port)
@@ -255,6 +332,8 @@ def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status").add_argument("--port", type=int, default=9235)
+    sub.add_parser("list").add_argument("--port", type=int, default=9235)
+    sub.add_parser("modes").add_argument("--port", type=int, default=9235)
     pa = sub.add_parser("ask")
     pa.add_argument("prompt")
     pa.add_argument("--port", type=int, default=9235)
@@ -265,6 +344,10 @@ def main():
 
     if args.cmd == "status":
         return cmd_status(args.port)
+    elif args.cmd == "list":
+        return cmd_list(args.port)
+    elif args.cmd == "modes":
+        return cmd_modes(args.port)
     elif args.cmd == "ask":
         return cmd_ask(args.prompt, args.port, args.timeout, args.idle)
 

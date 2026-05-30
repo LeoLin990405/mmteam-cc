@@ -55,6 +55,43 @@ extract_issues_count() {
   ' "$1" 2>/dev/null
 }
 
+cmd_list() {
+  # Antigravity has no native multi-conversation list (only "new" resets).
+  # Attempt CDP DOM enumeration via opencli's dump (bypasses ws origin check).
+  python3 <<PYEOF
+import json, subprocess
+try:
+    dump = subprocess.check_output(["opencli", "antigravity", "dump"], timeout=10, stderr=subprocess.DEVNULL).decode(errors='ignore')
+except Exception as e:
+    dump = ""
+out = {
+    "surface": "antigravity",
+    "stateless": False,
+    "active_session": "current",  # antigravity exposes only the current conversation
+    "sessions": [{"id": "current", "title": "(only the active conversation is addressable)"}],
+    "note": "Antigravity adapter has no history/threads concept; 'opencli antigravity new' clears and starts fresh. To enumerate via DOM, launcher needs --remote-allow-origins=*",
+    "dump_chars": len(dump)
+}
+print(json.dumps(out, indent=2, ensure_ascii=False))
+PYEOF
+}
+
+cmd_modes() {
+  # Antigravity 'mode' axis = which LLM model is active.
+  local model_raw
+  model_raw=$(opencli antigravity model 2>&1 || true)
+  python3 <<PYEOF
+import json
+raw = """$model_raw"""
+print(json.dumps({
+    "surface": "antigravity",
+    "axis": "model",
+    "active_mode_raw": raw.strip()[:200],
+    "note": "Antigravity's mode axis is its LLM model (Gemini variants). Use 'opencli antigravity model <name>' to switch."
+}, indent=2))
+PYEOF
+}
+
 cmd_status() {
   echo "=== Antigravity CDP (port 9234) ==="
   if curl -s --max-time 2 "http://localhost:9234/json/version" | grep -q "Browser"; then
@@ -165,6 +202,8 @@ parse_opts() {
 }
 
 case "$CMD" in
+  list)   cmd_list ;;
+  modes)  cmd_modes ;;
   status) cmd_status ;;
   ask)    shift; parse_opts "$@"; cmd_ask "${REST[@]:-}" ;;
   review) shift; parse_opts "$@"; cmd_review "${REST[@]:-}" ;;

@@ -58,13 +58,16 @@ sleep 1
 
 # Step 2: launch with CDP flag (the Electron binary inside TRAE SOLO.app
 # is named "Electron"; bundle identifier handles app branding)
-echo "[trae-solo-launch] launching with --remote-debugging-port=$PORT..."
+# --remote-allow-origins=* is needed for Chrome 142+ to accept WebSocket
+# connections from non-DevTools origins (e.g. python websocket-client, opencli
+# generic browser). Without it, ws handshake returns 403 Forbidden.
+echo "[trae-solo-launch] launching with --remote-debugging-port=$PORT + --remote-allow-origins=*..."
 if [ "$BG" = "1" ]; then
-  nohup "$BIN" --remote-debugging-port="$PORT" >/dev/null 2>&1 &
+  nohup "$BIN" --remote-debugging-port="$PORT" --remote-allow-origins=* >/dev/null 2>&1 &
   disown
   echo "[trae-solo-launch] launched in background (pid $!)."
 else
-  "$BIN" --remote-debugging-port="$PORT" >/dev/null 2>&1 &
+  "$BIN" --remote-debugging-port="$PORT" --remote-allow-origins=* >/dev/null 2>&1 &
   echo "[trae-solo-launch] launched (pid $!). Returning to shell."
 fi
 

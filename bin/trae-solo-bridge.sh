@@ -168,6 +168,8 @@ parse_opts() {
 
 case "$CMD" in
   status) cmd_status ;;
+  list)   exec "$PYTHON" "$CDP_HELPER" list --port "$PORT" ;;
+  modes)  exec "$PYTHON" "$CDP_HELPER" modes --port "$PORT" ;;
   ask)    shift; parse_opts "$@"; cmd_ask "${REST[@]:-}" ;;
   review) shift; parse_opts "$@"; cmd_review "${REST[@]:-}" ;;
   ""|-h|--help)

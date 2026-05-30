@@ -92,6 +92,43 @@ except Exception:
 " "$1"
 }
 
+cmd_list() {
+  # qodercli has a `jobs` subcommand for concurrent jobs.
+  require_qodercli
+  local jobs_raw
+  jobs_raw=$(qodercli jobs 2>&1 || true)
+  python3 <<PYEOF
+import json
+raw = """$jobs_raw"""
+print(json.dumps({
+    "surface": "qoder-cli",
+    "stateless": True,
+    "active_session": None,
+    "concurrent_jobs_raw": raw[:500],
+    "note": "qodercli sessions are stateless per-invocation; --continue (-c) flag resumes the most recent. 'qodercli jobs' lists in-flight concurrent jobs."
+}, indent=2))
+PYEOF
+}
+
+cmd_modes() {
+  python3 <<PYEOF
+import json
+print(json.dumps({
+    "surface": "qoder-cli",
+    "axis": "agent-config",
+    "active_mode": "default",
+    "available_modes": [
+        "--allowed-tools <list>",
+        "--disallowed-tools <list> (used by review)",
+        "--max-turns <N>",
+        "--dangerously-skip-permissions",
+        "--agents <json>  (define custom agents)"
+    ],
+    "note": "Qoder CLI's mode axis is the agent-config flags. Review path uses --disallowed-tools 'Edit,Write' to prevent code modification."
+}, indent=2))
+PYEOF
+}
+
 cmd_status() {
   require_qodercli
   echo "qodercli: $(command -v qodercli)"
@@ -161,6 +198,8 @@ parse_opts() {
 }
 
 case "$CMD" in
+  list)   cmd_list ;;
+  modes)  cmd_modes ;;
   status) cmd_status ;;
   ask)    shift; parse_opts "$@"; cmd_ask "${REST[@]:-}" ;;
   review) shift; parse_opts "$@"; cmd_review "${REST[@]:-}" ;;
