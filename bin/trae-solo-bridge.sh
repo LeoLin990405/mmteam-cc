@@ -137,6 +137,7 @@ cmd_ask() {
   echo "RESPONSE_FILE=$response_file"
   echo "---"
   cat "$response_file"
+  extract_callbacks "$response_file" "trae-solo"
 }
 
 cmd_review() {
@@ -155,6 +156,7 @@ cmd_review() {
   echo "RESPONSE_FILE=$response_file"
   echo "---"
   cat "$response_file"
+  extract_callbacks "$response_file" "trae-solo"
 }
 
 parse_opts() {

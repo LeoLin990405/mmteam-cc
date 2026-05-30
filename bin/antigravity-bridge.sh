@@ -182,6 +182,7 @@ cmd_ask() {
   echo "RAW_FILE=$raw_file"
   echo "---"
   cat "$text_file"
+  extract_callbacks "$text_file" "antigravity"
 }
 
 cmd_review() {
@@ -207,6 +208,7 @@ cmd_review() {
   echo "RAW_FILE=$raw_file"
   echo "---"
   cat "$text_file"
+  extract_callbacks "$text_file" "antigravity"
 }
 
 parse_opts() {

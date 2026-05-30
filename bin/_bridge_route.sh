@@ -67,6 +67,28 @@ strip_frontmatter() {
   fi
 }
 
+extract_callbacks() {
+  # Scan a response file for @callback-claude / <<CALLBACK>> markers,
+  # write each to ~/.claude/inbox/, echo a summary line to stderr.
+  # No-op if no markers or _inbox.py missing.
+  local resp="$1" surface="$2"
+  local helper="$HOME/.claude/bin/_inbox.py"
+  [ -x "$helper" ] || return 0
+  [ -f "$resp" ] || return 0
+  local res n
+  res=$("$helper" extract "$resp" --surface "$surface" --thread "${ROUTE_THREAD:-current}" 2>/dev/null) || return 0
+  n=$(printf '%s' "$res" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('extracted',0))" 2>/dev/null || echo 0)
+  if [ "$n" -gt 0 ] 2>/dev/null; then
+    echo "[callback] $n message(s) extracted to ~/.claude/inbox/" >&2
+    printf '%s' "$res" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for e in d.get('inbox_entries', []):
+    print('  →', e, file=sys.stderr)
+" 2>/dev/null || true
+  fi
+}
+
 inject_routing_context() {
   local prompt="$1"
   if [ -z "$ROUTE_PROJECT" ] && [ -z "$ROUTE_THREAD" ] && [ -z "$ROUTE_MODE" ]; then

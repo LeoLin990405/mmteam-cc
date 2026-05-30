@@ -155,6 +155,7 @@ cmd_ask() {
   echo "RESPONSE_FILE=$response_file"
   echo "---"
   cat "$response_file"
+  extract_callbacks "$response_file" "codex-app"
 }
 
 cmd_review() {
@@ -190,6 +191,7 @@ cmd_review() {
   echo "EXPORT_FILE=$export_file"
   echo "---"
   cat "$response_file"
+  extract_callbacks "$response_file" "codex-app"
 }
 
 # -------- arg parsing for --timeout --out --------

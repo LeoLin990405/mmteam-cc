@@ -8,12 +8,15 @@
 #   agent-bridge <surface> <verb> [args...]
 #   agent-bridge --list                    # show all surfaces + status snapshot
 #   agent-bridge --status                  # ping all bridges, print state matrix
+#   agent-bridge inbox <list|read|clear>   # reverse-callback inbox (Layer 4)
 #
 # Examples:
 #   agent-bridge codex-cli status
 #   agent-bridge codex-app review /path/to/review.md
 #   agent-bridge antigravity review /path/to/review.md --timeout 600
 #   agent-bridge qoder-cli ask "explain X"
+#   agent-bridge inbox list --unread-only
+#   agent-bridge inbox read blocker
 #   agent-bridge --status                  # one-shot health check across all
 #
 # Each <surface>-bridge.sh maps:
@@ -117,6 +120,15 @@ dispatch() {
 case "${1:-}" in
   --list|-l)    list_surfaces ;;
   --status|-s)  status_all ;;
+  inbox)
+    # Layer 4 — reverse callback inbox. Pass through to _inbox.py.
+    shift
+    if [ ! -x "$BIN_DIR/_inbox.py" ]; then
+      echo "[agent-bridge] inbox helper not found: $BIN_DIR/_inbox.py" >&2
+      exit 1
+    fi
+    exec "$BIN_DIR/_inbox.py" "$@"
+    ;;
   ""|-h|--help)
     sed -n '2,/^$/p' "$0" | sed 's/^# //'
     exit 0
