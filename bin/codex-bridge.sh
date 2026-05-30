@@ -30,6 +30,26 @@
 set -euo pipefail
 
 source "$HOME/.claude/bin/_bridge_route.sh"
+source "$HOME/.claude/bin/_bridge_delete.sh"
+
+cmd_delete() {
+  parse_delete_args "$@"
+  if [ -z "$DELETE_ID" ] && [ "$DELETE_ALL" != "1" ]; then
+    echo "[codex-app:delete] need <thread-id> or --all." >&2
+    echo "  Get ids: agent-bridge codex-app list | jq '.sessions[].id'" >&2
+    exit 2
+  fi
+  delete_banner "codex-app" "delete thread via CDP sidebar trash click" "${DELETE_ID:-ALL}"
+  if [ "$DELETE_DRY_RUN" = "1" ]; then return 0; fi
+  # CDP click delete-icon path not yet implemented — opencli codex has no
+  # native delete-thread command (only 'new'). Real implementation requires
+  # CDP eval to find the sidebar item by thread id then click its trash
+  # icon. Selector unknown until DevTools reverse-engineering.
+  echo "[codex-app:delete] NOT IMPLEMENTED — Codex App has no opencli delete command." >&2
+  echo "  Workaround: in the Codex App UI, hover the thread → click trash icon." >&2
+  echo "  TODO: CDP eval click; see ~/.claude/bin/_trae-solo-cdp.py for the pattern." >&2
+  exit 1
+}
 
 CMD="${1:-}"
 TIMEOUT_SEC=600
@@ -220,6 +240,10 @@ case "$CMD" in
     ;;
   status)
     cmd_status
+    ;;
+  delete)
+    shift
+    cmd_delete "$@"
     ;;
   ask)
     shift

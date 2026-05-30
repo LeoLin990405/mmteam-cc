@@ -23,6 +23,22 @@
 set -euo pipefail
 
 source "$HOME/.claude/bin/_bridge_route.sh"
+source "$HOME/.claude/bin/_bridge_delete.sh"
+
+cmd_delete() {
+  parse_delete_args "$@"
+  if [ -z "$DELETE_ID" ] && [ "$DELETE_ALL" != "1" ]; then
+    echo "[trae-solo:delete] need <session-id> or --all." >&2
+    echo "  Get ids: agent-bridge trae-solo list | jq '.sessions[].id'" >&2
+    exit 2
+  fi
+  delete_banner "trae-solo" "delete chat session via CDP click" "${DELETE_ID:-ALL}"
+  if [ "$DELETE_DRY_RUN" = "1" ]; then return 0; fi
+  echo "[trae-solo:delete] NOT IMPLEMENTED — CDP click selector for delete menu unknown." >&2
+  echo "  Workaround: TRAE SOLO UI → hover session row → 3-dot menu → Delete chat." >&2
+  echo "  TODO: add cmd_delete to ~/.claude/bin/_trae-solo-cdp.py once selector known." >&2
+  exit 1
+}
 
 # ─── ARCHITECTURE NOTE ────────────────────────────────────────────────
 # Selectors are kept in the Python helper (~/.claude/bin/_trae-solo-cdp.py)
@@ -177,6 +193,7 @@ case "$CMD" in
   status) cmd_status ;;
   list)   exec "$PYTHON" "$CDP_HELPER" list --port "$PORT" ;;
   modes)  exec "$PYTHON" "$CDP_HELPER" modes --port "$PORT" ;;
+  delete) shift; cmd_delete "$@" ;;
   ask)
 
     shift; parse_opts "$@"

@@ -27,6 +27,39 @@
 set -euo pipefail
 
 source "$HOME/.claude/bin/_bridge_route.sh"
+source "$HOME/.claude/bin/_bridge_delete.sh"
+
+cmd_delete() {
+  parse_delete_args "$@"
+  # codex CLI is stateless per-invocation; session files in ~/.codex/sessions
+  # are the only persistent state.
+  local sess_dir="$HOME/.codex/sessions"
+  if [ ! -d "$sess_dir" ]; then
+    echo "[codex-cli:delete] no session storage at $sess_dir — stateless CLI." >&2
+    exit 1
+  fi
+  if [ "$DELETE_ALL" = "1" ]; then
+    delete_banner "codex-cli" "rm ALL files in" "$sess_dir"
+    if [ "$DELETE_DRY_RUN" = "1" ]; then
+      ls -la "$sess_dir" | head -10 >&2
+      return 0
+    fi
+    rm -rf "$sess_dir"/*
+    return 0
+  fi
+  if [ -z "$DELETE_ID" ]; then
+    echo "[codex-cli:delete] need <filename> or --all." >&2
+    exit 2
+  fi
+  local target="$sess_dir/$DELETE_ID"
+  if [ ! -e "$target" ]; then
+    echo "[codex-cli:delete] not found: $target" >&2
+    exit 1
+  fi
+  delete_banner "codex-cli" "rm" "$target"
+  if [ "$DELETE_DRY_RUN" = "1" ]; then return 0; fi
+  rm -rf "$target"
+}
 
 CMD="${1:-}"
 TIMEOUT_SEC=600
@@ -171,6 +204,7 @@ case "$CMD" in
   list)   cmd_list ;;
   modes)  cmd_modes ;;
   status) cmd_status ;;
+  delete) shift; cmd_delete "$@" ;;
   ask)
 
     shift; parse_opts "$@"

@@ -25,6 +25,25 @@
 set -euo pipefail
 
 source "$HOME/.claude/bin/_bridge_route.sh"
+source "$HOME/.claude/bin/_bridge_delete.sh"
+
+cmd_delete() {
+  parse_delete_args "$@"
+  require_qodercli
+  if [ "$DELETE_ALL" = "1" ]; then
+    delete_banner "qoder-cli" "rm ALL concurrent jobs" "(via qodercli rm --all if supported)"
+    if [ "$DELETE_DRY_RUN" = "1" ]; then return 0; fi
+    qodercli rm --all 2>&1 || qodercli jobs 2>&1 | awk 'NR>1 {print $1}' | xargs -r -I{} qodercli rm {}
+    return $?
+  fi
+  if [ -z "$DELETE_ID" ]; then
+    echo "[qoder-cli:delete] need <job-id> or --all (qoder-cli sessions are jobs, not threads)." >&2
+    exit 2
+  fi
+  delete_banner "qoder-cli" "rm job" "$DELETE_ID"
+  if [ "$DELETE_DRY_RUN" = "1" ]; then return 0; fi
+  qodercli rm "$DELETE_ID"
+}
 
 CMD="${1:-}"
 TIMEOUT_SEC=600
@@ -208,6 +227,7 @@ case "$CMD" in
   list)   cmd_list ;;
   modes)  cmd_modes ;;
   status) cmd_status ;;
+  delete) shift; cmd_delete "$@" ;;
   ask)
 
     shift; parse_opts "$@"

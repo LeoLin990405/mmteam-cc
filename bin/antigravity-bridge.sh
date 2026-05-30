@@ -25,6 +25,17 @@
 set -euo pipefail
 
 source "$HOME/.claude/bin/_bridge_route.sh"
+source "$HOME/.claude/bin/_bridge_delete.sh"
+
+cmd_delete() {
+  parse_delete_args "$@"
+  local target="${DELETE_ID:-current}"
+  delete_banner "antigravity" "clear (reset to fresh conversation)" "$target"
+  if [ "$DELETE_DRY_RUN" = "1" ]; then return 0; fi
+  # antigravity has no thread-history; 'new' wipes the active conversation.
+  opencli antigravity new
+  echo "[delete] antigravity conversation cleared."
+}
 
 CMD="${1:-}"
 PORT=8082
@@ -229,6 +240,7 @@ case "$CMD" in
   list)   cmd_list ;;
   modes)  cmd_modes ;;
   status) cmd_status ;;
+  delete) shift; cmd_delete "$@" ;;
   ask)
 
     shift; parse_opts "$@"
