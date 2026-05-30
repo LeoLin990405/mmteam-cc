@@ -51,15 +51,20 @@ sleep 2
 pkill -f "/Applications/Antigravity.app/Contents/MacOS/Antigravity" 2>/dev/null || true
 sleep 1
 
-# Step 2: launch with CDP flag
-echo "[antigravity-launch] launching with --remote-debugging-port=$PORT..."
+# Step 2: launch with CDP + ws origin allowlist
+# --remote-allow-origins=* is required for Chrome 142+ which enforces
+# WebSocket origin checks on the CDP /devtools/* endpoints. Without it,
+# any external ws client (including our Python CDP helper) gets HTTP 403
+# during the WebSocket upgrade. Same flag is already on the Trae SOLO
+# launcher for the same reason.
+echo "[antigravity-launch] launching with --remote-debugging-port=$PORT --remote-allow-origins=*..."
 if [ "$BG" = "1" ]; then
-  nohup "$BIN" --remote-debugging-port="$PORT" >/dev/null 2>&1 &
+  nohup "$BIN" --remote-debugging-port="$PORT" --remote-allow-origins=* >/dev/null 2>&1 &
   disown
   echo "[antigravity-launch] launched in background (pid $!)."
 else
   # Foreground but detach from terminal session
-  "$BIN" --remote-debugging-port="$PORT" >/dev/null 2>&1 &
+  "$BIN" --remote-debugging-port="$PORT" --remote-allow-origins=* >/dev/null 2>&1 &
   echo "[antigravity-launch] launched (pid $!). Returning to shell."
 fi
 

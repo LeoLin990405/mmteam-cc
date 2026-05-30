@@ -58,23 +58,40 @@ extract_issues_count() {
 }
 
 cmd_list() {
-  # Antigravity has no native multi-conversation list (only "new" resets).
-  # Attempt CDP DOM enumeration via opencli's dump (bypasses ws origin check).
-  python3 <<PYEOF
+  # Path 1: CDP ws probe (requires launcher --remote-allow-origins=* AND websocket-client).
+  # Path 2: fallback to opencli antigravity dump (always works, no thread enum).
+  local helper="$HOME/.claude/bin/_antigravity-cdp.py"
+  local pybin
+  if [ -x "$HOME/.claude/bin/.venv/bin/python3" ]; then
+    pybin="$HOME/.claude/bin/.venv/bin/python3"
+  elif [ -x "$HOME/Projects/nd0044-fyyur/.venv/bin/python3" ]; then
+    pybin="$HOME/Projects/nd0044-fyyur/.venv/bin/python3"
+  else
+    pybin="python3"
+  fi
+  if [ -x "$helper" ] && "$pybin" -c "import websocket" 2>/dev/null; then
+    local _probe_out
+    if _probe_out=$("$pybin" "$helper" list --port 9234 2>/dev/null); then
+      printf '%s\n' "$_probe_out"
+      return 0
+    fi
+  fi
+  # Fallback
+  python3 <<'PYEOF'
 import json, subprocess
 try:
     dump = subprocess.check_output(["opencli", "antigravity", "dump"], timeout=10, stderr=subprocess.DEVNULL).decode(errors='ignore')
-except Exception as e:
+except Exception:
     dump = ""
-out = {
+print(json.dumps({
     "surface": "antigravity",
     "stateless": False,
-    "active_session": "current",  # antigravity exposes only the current conversation
-    "sessions": [{"id": "current", "title": "(only the active conversation is addressable)"}],
-    "note": "Antigravity adapter has no history/threads concept; 'opencli antigravity new' clears and starts fresh. To enumerate via DOM, launcher needs --remote-allow-origins=*",
-    "dump_chars": len(dump)
-}
-print(json.dumps(out, indent=2, ensure_ascii=False))
+    "active_session": "current",
+    "sessions": [{"id": "current", "title": "(CDP ws probe unavailable; only the active conversation is addressable via opencli)"}],
+    "note": "Antigravity launcher needs --remote-allow-origins=* (added 2026-05-30 to launcher) — relaunch Antigravity with ~/.claude/bin/antigravity-launch-with-cdp.sh to enable ws DOM probe.",
+    "dump_chars": len(dump),
+    "fallback": True
+}, indent=2, ensure_ascii=False))
 PYEOF
 }
 
