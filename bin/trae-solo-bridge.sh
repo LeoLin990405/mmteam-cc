@@ -22,23 +22,30 @@
 
 set -euo pipefail
 
-# ─── DOM SELECTOR CONFIG ──────────────────────────────────────────────
-# Filled in after Leo's DevTools recon (Step 2 of the Trae SOLO Phase 2 plan).
-# Update these 4 strings when TRAE SOLO UI changes (e.g. after app upgrade).
+# ─── ARCHITECTURE NOTE ────────────────────────────────────────────────
+# Selectors are kept in the Python helper (~/.claude/bin/_trae-solo-cdp.py)
+# because TRAE SOLO uses Lexical editor (Facebook framework) which needs
+# clipboard-paste event synthesis — bash + opencli `browser fill` can't
+# replicate that. The helper talks to TRAE SOLO over CDP WebSocket directly.
 #
-# How to find each:
-#   - In TRAE SOLO with CDP up: Cmd+Shift+I → Cmd+Shift+C → click each element
-#   - Prefer stable selectors: [data-*], unique aria-label, or class names
-#     beginning with `chat-` / `prompt-` (avoid hash-suffixed VSCode classes
-#     like `.monaco-list-row .codicon-xxxx`)
-
-CHAT_INPUT_SELECTOR=""        # e.g. 'div[contenteditable="true"][data-test-id="chat-input"]'
-SEND_BUTTON_SELECTOR=""       # e.g. 'button[aria-label="Send message"]'
-RESPONSE_CONTAINER_SELECTOR="" # e.g. 'div[data-role="assistant-message"]:last-child'
-DONE_SIGNAL_SELECTOR=""       # e.g. 'button[aria-label="Send message"]:not([disabled])'
-                              # (button re-enabled = streaming done; or use a
-                              # negative spinner class via DOM hash polling)
+# Done-signal strategy: DOM-hash idle detection (poll last message outerHTML
+# every 0.5s; 4s of stable hash → AI finished streaming). More robust than
+# button-class check because Trae SOLO disables send button both during
+# streaming AND when input is empty.
+#
+# Update _trae-solo-cdp.py's SELECTOR CONFIG block if Trae SOLO UI changes.
 # ──────────────────────────────────────────────────────────────────────
+
+CDP_HELPER="$HOME/.claude/bin/_trae-solo-cdp.py"
+# Use the agent-bridge venv if it exists; otherwise system python3 (must have
+# websocket-client installed: pip install --break-system-packages websocket-client)
+if [ -x "$HOME/.claude/bin/.venv/bin/python3" ]; then
+  PYTHON="$HOME/.claude/bin/.venv/bin/python3"
+elif [ -x "$HOME/Projects/nd0044-fyyur/.venv/bin/python3" ]; then
+  PYTHON="$HOME/Projects/nd0044-fyyur/.venv/bin/python3"
+else
+  PYTHON="python3"
+fi
 
 CMD="${1:-}"
 PORT=9235
@@ -49,10 +56,12 @@ mkdir -p "$OUT_DIR"
 
 die() { echo "[trae-solo-bridge] $*" >&2; exit "${2:-1}"; }
 
-check_selectors() {
-  if [ -z "$CHAT_INPUT_SELECTOR" ] || [ -z "$SEND_BUTTON_SELECTOR" ] \
-     || [ -z "$RESPONSE_CONTAINER_SELECTOR" ] || [ -z "$DONE_SIGNAL_SELECTOR" ]; then
-    die "DOM selectors not filled in. Edit the SELECTOR CONFIG block at the top of this file." 2
+check_helper() {
+  if [ ! -f "$CDP_HELPER" ]; then
+    die "CDP helper missing: $CDP_HELPER" 2
+  fi
+  if ! "$PYTHON" -c "import websocket" 2>/dev/null; then
+    die "websocket-client not installed for $PYTHON. Run: $PYTHON -m pip install websocket-client" 2
   fi
 }
 
@@ -94,45 +103,34 @@ print(f'  UA: {d.get(\"User-Agent\",\"?\")[:80]}')
     exit 1
   fi
   echo
-  echo "=== Selectors configured ==="
-  for k in CHAT_INPUT_SELECTOR SEND_BUTTON_SELECTOR RESPONSE_CONTAINER_SELECTOR DONE_SIGNAL_SELECTOR; do
-    eval v=\$$k
-    if [ -z "$v" ]; then
-      echo "✗ $k = (empty — edit this file)"
-    else
-      echo "✓ $k = $v"
-    fi
-  done
+  echo "=== Python CDP helper ==="
+  if [ ! -f "$CDP_HELPER" ]; then
+    echo "✗ helper missing: $CDP_HELPER"
+  elif ! "$PYTHON" -c "import websocket" 2>/dev/null; then
+    echo "✗ websocket-client not installed for $PYTHON"
+    echo "  fix: $PYTHON -m pip install --break-system-packages websocket-client"
+  else
+    echo "✓ helper ready: $CDP_HELPER"
+    echo "✓ python: $PYTHON"
+    "$PYTHON" "$CDP_HELPER" status --port "$PORT" 2>&1 | sed 's/^/  /'
+  fi
 }
 
 cmd_ask() {
   local prompt="${1:-}"
   [ -z "$prompt" ] && die "ask: missing prompt text" 2
   check_cdp
-  check_selectors
+  check_helper
 
   local ts response_file
   ts=$(date +%Y%m%d-%H%M%S)
   response_file="$OUT_DIR/ask-$ts.md"
 
-  echo "[trae-solo-bridge] bind CDP session :$PORT (timeout ${TIMEOUT_SEC}s)..." >&2
-  opencli browser bind "$SESSION" 2>&1 | tail -3 >&2 || die "browser bind failed" 1
-
-  echo "[trae-solo-bridge] fill chat input..." >&2
-  opencli browser fill --selector "$CHAT_INPUT_SELECTOR" "$prompt" 2>&1 | tail -3 >&2 \
-    || die "fill chat input failed (selector? $CHAT_INPUT_SELECTOR)" 1
-
-  echo "[trae-solo-bridge] click send button..." >&2
-  opencli browser click --selector "$SEND_BUTTON_SELECTOR" 2>&1 | tail -3 >&2 \
-    || die "click send button failed (selector? $SEND_BUTTON_SELECTOR)" 1
-
-  echo "[trae-solo-bridge] wait for done signal (timeout ${TIMEOUT_SEC}s)..." >&2
-  opencli browser wait selector "$DONE_SIGNAL_SELECTOR" --timeout "$TIMEOUT_SEC" 2>&1 | tail -3 >&2 \
-    || die "wait timed out — AI may still be generating, or DONE_SIGNAL_SELECTOR is wrong" 1
-
-  echo "[trae-solo-bridge] extract response..." >&2
-  opencli browser extract --selector "$RESPONSE_CONTAINER_SELECTOR" -f md > "$response_file" 2>&1 \
-    || die "extract failed (selector? $RESPONSE_CONTAINER_SELECTOR)" 1
+  echo "[trae-solo-bridge] ask via CDP helper (timeout ${TIMEOUT_SEC}s)..." >&2
+  if ! "$PYTHON" "$CDP_HELPER" ask "$prompt" --port "$PORT" --timeout "$TIMEOUT_SEC" > "$response_file" 2>>"$response_file.stderr"; then
+    cat "$response_file.stderr" >&2
+    die "trae-solo-cdp ask failed; partial output: $response_file" 1
+  fi
 
   echo "RESPONSE_FILE=$response_file"
   echo "---"
