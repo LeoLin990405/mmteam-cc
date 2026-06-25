@@ -1,3 +1,9 @@
+<div align="center">
+
+[![English](https://img.shields.io/badge/Language-English-2ea44f?style=for-the-badge)](README.md) &nbsp; [![中文](https://img.shields.io/badge/语言-中文-555555?style=for-the-badge)](README.zh-CN.md)
+
+</div>
+
 # mmteam-cc
 
 > Multi-Model Agent Teams for Claude Code — orchestrate 10 AI CLIs via Google A2A v0.3 + MCP bridge.
