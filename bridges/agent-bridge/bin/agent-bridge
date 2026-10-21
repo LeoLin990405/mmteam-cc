@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# agent-bridge — Unified dispatcher for 5 surface bridges.
+#
+# Single entry-point for Claude to drive any of the 5 surfaces:
+#   codex-cli / codex-app / antigravity / qoder-cli / trae-solo
+#
+# Usage:
+#   agent-bridge <surface> <verb> [args...]
+#   agent-bridge --list                    # show all surfaces + status snapshot
+#   agent-bridge --status                  # ping all bridges, print state matrix
+#   agent-bridge inbox <list|read|clear>   # reverse-callback inbox (Layer 4)
+#   agent-bridge count                     # session counts across all surfaces
+#   agent-bridge inventory                 # opencli adapter inventory + diff
+#   agent-bridge update [--check|--auto|--use-fork]   # update opencli pkg + sync fork
+#
+# Examples:
+#   agent-bridge codex-cli status
+#   agent-bridge codex-app review /path/to/review.md
+#   agent-bridge antigravity review /path/to/review.md --timeout 600
+#   agent-bridge qoder-cli ask "explain X"
+#   agent-bridge inbox list --unread-only
+#   agent-bridge inbox read blocker
+#   agent-bridge --status                  # one-shot health check across all
+#
+# Each <surface>-bridge.sh maps:
+#   codex-cli   → ~/.claude/bin/codex-cli-bridge.sh
+#   codex-app   → ~/.claude/bin/codex-bridge.sh         (legacy name = the App driver)
+#   antigravity → ~/.claude/bin/antigravity-bridge.sh
+#   qoder-cli   → ~/.claude/bin/qoder-cli-bridge.sh
+#   trae-solo   → ~/.claude/bin/trae-solo-bridge.sh     (待写 — Phase 2)
+
+set -euo pipefail
+
+BIN_DIR="$HOME/.claude/bin"
+
+declare -A SURFACES=(
+  [codex-cli]="codex-cli-bridge.sh"
+  [codex-app]="codex-bridge.sh"
+  [antigravity]="antigravity-bridge.sh"
+  [qoder-cli]="qoder-cli-bridge.sh"
+  [trae-solo]="trae-solo-bridge.sh"
+  [grok]="grok-bridge.sh"
+)
+
+list_surfaces() {
+  echo "Available surfaces:"
+  for s in codex-cli codex-app antigravity qoder-cli trae-solo grok; do
+    local script="$BIN_DIR/${SURFACES[$s]}"
+    if [ -x "$script" ]; then
+      echo "  ✓ $s   → $script"
+    else
+      echo "  ✗ $s   → $script (not installed)"
+    fi
+  done
+}
+
+status_all() {
+  # Compact one-line health (parses ✓/✗ from each bridge's own status output)
+  echo "═══ Surface health summary ═══"
+  printf "%-13s | %-12s | %s\n" "surface" "installed" "ready signal"
+  printf "%-13s-+-%-12s-+-%s\n" "-------------" "------------" "------------------------"
+  for s in codex-cli codex-app antigravity qoder-cli trae-solo grok; do
+    local script="$BIN_DIR/${SURFACES[$s]}"
+    local installed="no"
+    local ready="(skipped)"
+    if [ -x "$script" ]; then
+      installed="yes"
+      # Capture stdout regardless of exit code (bridges may exit 1 when CDP down
+      # but stdout still has ✓/✗ summary). timeout itself returns 124 on timeout.
+      st_raw=$(timeout 10 "$script" status 2>&1 || true)
+      local good bad
+      good=$(echo "$st_raw" | grep -cE '✓' || true)
+      bad=$(echo "$st_raw" | grep -cE '✗' || true)
+      if [ "$bad" -gt 0 ] && [ "$good" -eq 0 ]; then
+        ready="✗ down ($bad failing)"
+      elif [ "$good" -gt 0 ] && [ "$bad" -eq 0 ]; then
+        ready="✓ ready ($good check)"
+      elif [ "$good" -gt 0 ] && [ "$bad" -gt 0 ]; then
+        ready="⚠ partial ($good ok / $bad down)"
+      elif echo "$st_raw" | grep -qiE "Connected|version:.*[0-9]"; then
+        ready="✓ ready"
+      elif echo "$st_raw" | grep -qiE "ok: false|error|failed"; then
+        ready="✗ down"
+      else
+        ready="?"
+      fi
+    fi
+    printf "%-13s | %-12s | %s\n" "$s" "$installed" "$ready"
+  done
+
+  # Detail per surface (multi-line, only shown if --verbose / -v)
+  if [ "${1:-}" = "-v" ] || [ "${1:-}" = "--verbose" ]; then
+    echo
+    for s in codex-cli codex-app antigravity qoder-cli trae-solo grok; do
+      local script="$BIN_DIR/${SURFACES[$s]}"
+      echo "═══ $s ═══"
+      if [ -x "$script" ]; then
+        timeout 10 "$script" status 2>&1 | grep -vE '^\s*$|UNDICI-EHPA' | head -10 | sed 's/^/  /'
+      else
+        echo "  (not installed: $script)"
+      fi
+      echo
+    done
+  fi
+}
+
+dispatch() {
+  local surface="$1"
+  shift
+  if [ -z "${SURFACES[$surface]:-}" ]; then
+    echo "[agent-bridge] unknown surface: $surface" >&2
+    echo "Try one of: ${!SURFACES[*]}" >&2
+    exit 2
+  fi
+  local script="$BIN_DIR/${SURFACES[$surface]}"
+  if [ ! -x "$script" ]; then
+    echo "[agent-bridge] $surface bridge not installed: $script" >&2
+    echo "  → Either write the bridge or use a different surface." >&2
+    exit 1
+  fi
+  exec "$script" "$@"
+}
+
+case "${1:-}" in
+  --list|-l)    list_surfaces ;;
+  --status|-s)  status_all ;;
+  inbox)
+    # Layer 4 — reverse callback inbox. Pass through to _inbox.py.
+    shift
+    if [ ! -x "$BIN_DIR/_inbox.py" ]; then
+      echo "[agent-bridge] inbox helper not found: $BIN_DIR/_inbox.py" >&2
+      exit 1
+    fi
+    exec "$BIN_DIR/_inbox.py" "$@"
+    ;;
+  inventory|--inventory)
+    # opencli adapter inventory — installed vs fork vs upstream
+    shift
+    exec "$BIN_DIR/opencli-inventory.sh" "$@"
+    ;;
+  update-opencli|update)
+    # Update the opencli npm pkg + sync fork main with upstream.
+    # Pass --check for dry-run, --auto for unattended, --use-fork for fork-built override.
+    shift
+    exec "$BIN_DIR/opencli-self-update.sh" "$@"
+    ;;
+  count|--count)
+    # Run 'list' on every surface, count sessions, print summary table.
+    printf "%-13s | %-7s | %s\n" "surface" "count" "note"
+    printf "%-13s-+-%-7s-+-%s\n" "-------------" "-------" "----------------------------"
+    grand=0
+    for s in codex-cli codex-app antigravity qoder-cli trae-solo grok; do
+      script="$BIN_DIR/${SURFACES[$s]:-}"
+      if [ ! -x "$script" ]; then
+        printf "%-13s | %-7s | %s\n" "$s" "-" "(bridge not installed)"
+        continue
+      fi
+      raw=$(timeout 15 "$script" list 2>/dev/null) || raw=""
+      if [ -z "$raw" ]; then
+        printf "%-13s | %-7s | %s\n" "$s" "?" "(list failed / timed out)"
+        continue
+      fi
+      n=$(printf '%s' "$raw" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    s = d.get('sessions', [])
+    print(len(s) if isinstance(s, list) else 0)
+except Exception:
+    print(0)
+" 2>/dev/null)
+      note=""
+      printf '%s' "$raw" | grep -q '"stateless": true' && note="stateless (per-invocation)"
+      printf '%s' "$raw" | grep -q '"fallback": true' && note="fallback (probe blocked)"
+      printf "%-13s | %-7s | %s\n" "$s" "$n" "$note"
+      grand=$((grand + n))
+    done
+    printf "%-13s-+-%-7s-+-%s\n" "-------------" "-------" "----------------------------"
+    printf "%-13s | %-7s |\n" "TOTAL" "$grand"
+    exit 0
+    ;;
+  ""|-h|--help)
+    sed -n '2,/^$/p' "$0" | sed 's/^# //'
+    exit 0
+    ;;
+  *)
+    dispatch "$@"
+    ;;
+esac
