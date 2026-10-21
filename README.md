@@ -281,3 +281,10 @@ mmteam-cc/
 Apache License 2.0 — see [LICENSE](LICENSE).
 
 This project implements wire-compatible subsets of the [A2A Protocol](https://a2a-protocol.org) and [MCP](https://spec.modelcontextprotocol.io) but is not affiliated with their respective organizations. See [NOTICE](NOTICE).
+
+
+---
+
+## Bridges (formerly `agent-bridge`)
+
+`bridges/agent-bridge/` keeps the former [`agent-bridge`](https://github.com/LeoLin990405/agent-bridge) repository (merged 2026-10-20): synchronous bridges that expose Codex CLI/App, Antigravity, Qoder CLI and Trae SOLO as callable CLIs for a Claude Code driven pipeline.

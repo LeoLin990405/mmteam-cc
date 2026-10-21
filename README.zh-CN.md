@@ -108,3 +108,10 @@ Claude Code(主会话)
 ## 许可
 
 Apache License 2.0 —— 见 [LICENSE](LICENSE)。本项目实现了 [A2A 协议](https://a2a-protocol.org) 与 [MCP](https://spec.modelcontextprotocol.io) 的线兼容子集,但与其各自组织无关联,见 [NOTICE](NOTICE)。
+
+
+---
+
+## Bridges（原 `agent-bridge`）
+
+`bridges/agent-bridge/` 保留原 [agent-bridge](https://github.com/LeoLin990405/agent-bridge) 仓库（2026-10-20 合并）：把 Codex CLI/App、Antigravity、Qoder CLI、Trae SOLO 包成可同步调用的 CLI，供 Claude Code 驱动的多智能体流水线使用。
